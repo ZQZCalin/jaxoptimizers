@@ -1,0 +1,86 @@
+model:
+  dim: 768
+  num_heads: 12
+  bias: False
+  num_blocks: 12
+  context_length: 1024
+  rescale_residuals: False 
+
+train:
+  data_path: "/projectnb/aclab/datasets/c4/en/"
+  
+  max_steps: 50000
+
+  # whether to use automatic mixed precision
+  use_amp: True
+  # value to cast to in mixed precision training.
+  precision: float16
+
+  # clip the gradient to have l2 norm at most this value
+  gradient_clip_val: 10.0
+
+  # lr schedule shape and scale
+  lr_warmup: 5000
+  lr_decay: linear
+  lr: 0.0001
+  
+  weight_decay: 0.01
+  batch_size: 4 # number of examples placed on each GPU
+
+  # options for mechanic
+  mechanize: False
+  mech_lambda: 0.01
+  # whether to apply the schedule before mechanic (True) or after mechanic (False)
+  bake_schedule: True
+  # whether to apply momentum before mechanic (True) of after mechanic (False)
+  bake_momentum: True
+  
+  # options for mechanic tuner algorithm
+  tuner: 
+    name: "centered_mirror_descent"
+    props:
+      G: 10
+      eps: 1e-8
+
+  # ADAM ONLY: whether to apply bias correction to compute mu_hat, nu_hat
+  correct_bias: True
+  # ADAM ONLY: whether to apply momentum update to mu
+  # set use_momentum=False will overwrite b1=0.0 and bake_momentum=True
+  use_momentum: True
+
+  optimizer: "adamw"
+
+  wandb_project: null
+  wandb_logs_per_sec: 1.0
+  
+  # this will slow down computation a bit (I believe due to extra GPU/CPU communication),
+  # but will log more stuff (like learning rates).
+  # Still working on nice way to do this logging - we really should only incur one communication
+  # round per iteration and I don't think the logging data should significantly impact it.
+  log_callback_data: True
+    
+
+  running_stats_window: 1000
+
+  # following settings chosen after
+  # some experimentation with a tiny model.
+  # may not be optimal for all machines, but
+  # hopefully with a reasonably sized model this will
+  # prevent dataloading from being the bottleneck.
+  dataloader_workers: 2
+
+  
+
+# In the future, we can specify parameters for each optimizer if needed.
+# An example is given below:
+# adamw:
+#   learning_rate: 0.0001
+#   weight_decay: 0.01
+#   b1: 0.9
+#   b2: 0.999
+#   eps: 1e-8
+#   eps_root: 0.0
+#   # For customized Adamw only: whether to apply bias correction to mu_hat and nu_hat
+#   correct_bias: True
+#   # For customized Adamw only: whether to apply momentum update to mu
+#   use_momentum: True
