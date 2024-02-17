@@ -3,10 +3,12 @@ from jax import numpy as jnp
 import equinox as eqx
 from jax import random as jr
 # from jax.random import PRNGKey, PRNGKeyArray
+# also, we are not using PRNGKey directly (but instead use jr.PRNGKey)
 from jax.random import PRNGKey
 # a temporary workaround: will be systematically fixed later
 from jax import Array as PRNGKeyArray
 from jaxamp import amp, DynamicScalerState, dynamic_scale_value_and_grad
+# Q: why do we import jaxtyping? currently, we don't use jax annotation?
 from jaxtyping import Array
 from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
 import hydra

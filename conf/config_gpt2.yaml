@@ -11,6 +11,9 @@ train:
   
   max_steps: 50000
 
+  # random seed for jax.random.PRNGKey
+  PRNGKey_seed: 0
+
   # whether to use automatic mixed precision
   use_amp: True
   # value to cast to in mixed precision training.

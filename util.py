@@ -1,8 +1,24 @@
 import jax
 from jax import numpy as jnp
 from jax import tree_util as jtu
-import optax
+from jax import Array
 from optax import GradientTransformation
+from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
+import ml_dtypes
+
+
+def get_accuracy(logits: Array, batch: Tuple[Array], ignore_index: int = -100):
+    input, target = batch # [N, L],  [N, L]
+    predictions = jnp.argmax(logits, axis=2) # [N, L, C] -> [N, L]
+    return jnp.sum(predictions == target) / jnp.sum(target != ignore_index)
+
+
+def get_dtype(dtype: str):
+    registry = {
+        "bfloat16": ml_dtypes.bfloat16,
+        "float16": jnp.float16,
+    }
+    return registry[dtype.lower()]
 
 
 def tree_norm(tree):
@@ -11,6 +27,7 @@ def tree_norm(tree):
             lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
         )
     )
+
 
 # TODO: This is hella slow. Needs better solution
 def log_optax(base_optimizer, log_fn):
