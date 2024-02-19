@@ -39,7 +39,7 @@ class TrainState(NamedTuple):
 
 
 def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
-    """Wraps C4 dataset.
+    """Wrapper for C4 dataset.
 
     Args:
         config (DictConfig): _description_
@@ -111,8 +111,9 @@ def train_step(
     batch: Tuple[Array, Array],
     optimizer: optax.GradientTransformation,
     key: Array,
-    config: Any,
+    config: DictConfig,
 ):
+    # Apply auto mixed precision.
     if config.use_amp:
         amp_loss_fn = amp(loss_fn, compute_dtype=get_dtype(config.precision))
         value_and_grad_fn = dynamic_scale_value_and_grad(
@@ -125,6 +126,7 @@ def train_step(
     opt_state = train_state.opt_state
     dynamic_scaler_state = train_state.dynamic_scaler_state
 
+    # Apply one-step update.
     if config.use_amp:
         dynamic_scaler_state, ((loss, logits), grads) = value_and_grad_fn(
             model, batch, key, dynamic_scaler_state=dynamic_scaler_state
@@ -143,6 +145,7 @@ def train_step(
         iteration=train_state.iteration + 1,
     )
 
+    # Log training info.
     accuracy = get_accuracy(logits, batch)
 
     log_data = {"grads/norm": tree_norm(grads)}
@@ -169,21 +172,35 @@ def train_loop(
     train_step_jit = eqx.filter_jit(
         jtu.Partial(train_step, config=config.train),
     )
+    # Just-in-time compilation of the train_step(..., config=config.train) function.
+    # [jax.jit](https://jax.readthedocs.io/en/latest/jax-101/02-jitting.html)
+    # [eqx.filter_jit](https://docs.kidger.site/equinox/api/transformations/#equinox.filter_jit)
+    # [jtu.Partial](https://jax.readthedocs.io/en/latest/_autosummary/jax.tree_util.Partial.html)
+    
+    # Initialize Wandb Logger
     beta = 1.0 - 1.0 / config.train.running_stats_window
     iteration_timing_events = ["iteration", "dataloader", "train_step"]
     time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
+
     for it, batch in pbar:
         if it > config.train.max_steps:
             break
+        # Logging message.
         tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
-        input_ids = jnp.asarray(batch["input_ids"])
-        labels = jnp.asarray(batch["labels"])
         samples = labels.shape[0]
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
+
+        # Load training batch.
+        input_ids = jnp.asarray(batch["input_ids"])
+        labels = jnp.asarray(batch["labels"])
         to_use, key = jr.split(key)
+
+        # Apply one-step train_step.
         loss, accuracy, log_data, train_state = train_step_jit(
             train_state, (input_ids, labels), optimizer, key=key
         )
+
+        # Update logger. (can be ignored for now...)
         time_keeper.mark(
             end_events={"train_step": 1},
         )
@@ -244,11 +261,13 @@ def train_loop(
 def train(config: DictConfig) -> None:
     logging.info(OmegaConf.to_yaml(config))
 
+    # Initialize C4 dataloader for gpt2.
     tokenizer = transformers.GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
     train_loader = load_c4_data(config, tokenizer)
 
+    # Initialize Wandb logging.
     if config.train.wandb_project is not None:
         limited_log = RateLimitedWandbLog(config.train.wandb_logs_per_sec)
         wandb.init(project=config.train.wandb_project)
@@ -256,6 +275,7 @@ def train(config: DictConfig) -> None:
     else:
         limited_log = None
 
+    # Initialize model, optimizer, and loss.
     model = GPT(tokenizer.vocab_size, config.model, key=jr.PRNGKey(42))
     optimizer, opt_state = init_optimizer(model, config.train, logger=limited_log)
 

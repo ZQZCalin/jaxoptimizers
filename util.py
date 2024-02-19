@@ -7,6 +7,18 @@ from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
 import ml_dtypes
 
 
+def tree_add(tree1, tree2):
+    return jtu.tree_map(lambda x,y: x+y, tree1, tree2)
+
+
+def tree_subtract(tree1, tree2):
+    return jtu.tree_map(lambda x,y: x-y, tree1, tree2)
+
+
+def tree_scalar_multiply(tree, scalar):
+    return jtu.tree_map(lambda x: scalar*x, tree)
+
+
 def get_accuracy(logits: Array, batch: Tuple[Array], ignore_index: int = -100):
     input, target = batch # [N, L],  [N, L]
     predictions = jnp.argmax(logits, axis=2) # [N, L, C] -> [N, L]
