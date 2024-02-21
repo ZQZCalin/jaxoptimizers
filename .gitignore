@@ -18,6 +18,9 @@ env/
 # hydra outputs
 outputs/
 
+# wandb log files
+wandb/
+
 # other directories
 opt/
 mechanic.py

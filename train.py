@@ -30,6 +30,11 @@ from logger import TimeKeeper, RateLimitedWandbLog
 from model.gpt import GPT
 from loader.c4_loader import get_c4_loader_next_token
 
+import sys
+sys.path.append('./optimizers')
+from optimizers.o2nc import o2nc, eo2nc, adamw
+from optimizers.online_learners import unconstrained_ogd
+
 
 class TrainState(NamedTuple):
     model: eqx.Module
@@ -85,6 +90,37 @@ def loss_fn(model: eqx.Module, batch: Tuple[Array, Array], key: Array):
     return jnp.mean(loss), logits
 
 
+def init_scheduler(
+    max_steps: int,
+    config: DictConfig
+) -> optax.ScalarOrSchedule:
+    """Parses the config and initializes the learning rate scheduler.
+
+    Args:
+        max_steps (int): _description_
+        config (DictConfig): optimizer / benchmark config.
+
+    Returns:
+        optax.ScalarOrSchedule.
+    """
+    if config.lr_schedule == "constant":
+        learning_rate = config.lr
+    elif config.lr_schedule == "cosine":
+        if config.lr_warmup:
+            learning_rate = optax.warmup_cosine_decay_schedule(
+                init_value=.0,
+                peak_value=config.lr,
+                warmup_steps=config.lr_warmup,
+                decay_steps=max_steps
+            )
+        else:
+            learning_rate = optax.cosine_decay_schedule(
+                init_value=config.lr,
+                decay_steps=max_steps
+            )
+    return learning_rate
+
+
 def init_optimizer(
     model: eqx.Module,
     config: DictConfig,
@@ -101,8 +137,57 @@ def init_optimizer(
         _type_: _description_
         _type_: _description_
     """
-    optimizer = None
-    opt_state = None
+    max_steps = config.train.max_steps
+    gradient_clip_val = config.train.gradient_clip_val
+    run_benchmark = config.train.run_benchmark
+    config = config.benchmark if run_benchmark else config.optimizer
+    
+    # Learning rate scheduler.
+    learning_rate = init_scheduler(max_steps, config)
+    
+    if run_benchmark:
+        # Run Adamw as the benchmark
+        if config.use_default:
+            optimizer = optax.adamw(
+                learning_rate=learning_rate,
+                b1=config.beta1,
+                b2=config.beta2,
+                weight_decay=config.weight_decay,
+            )
+        else:
+            optimizer = adamw(
+                learning_rate=learning_rate,
+                beta1=config.beta1,
+                beta2=config.beta2,
+                weight_decay=config.weight_decay,
+                debias_beta1=config.debias_beta1,
+                debias_beta2=config.debias_beta2
+            )
+    else:
+        # Base online learner.
+        if config.online_learner == "unconstrained_ogd":
+            online_learner = unconstrained_ogd(
+                learning_rate=learning_rate,
+                beta=config.beta,
+                mu=config.mu
+            )
+
+        # Wrap base online learner with (Exponentiated) O2NC.
+        if config.use_eo2nc:
+            optimizer = eo2nc(online_learner, config.seed)
+        else:
+            optimizer = o2nc(online_learner, config.seed)
+
+    # Gradient clipping and NaN wrapper.
+    grad_clip = optax.clip_by_global_norm(gradient_clip_val)
+    optimizer = optax.chain(
+        grad_clip,
+        optax.apply_if_finite(optimizer, 15)
+    )
+
+    # Initialize opt_state
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+
     return optimizer, opt_state
 
 
@@ -185,15 +270,15 @@ def train_loop(
     for it, batch in pbar:
         if it > config.train.max_steps:
             break
-        # Logging message.
-        tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
-        samples = labels.shape[0]
-        time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
-
         # Load training batch.
         input_ids = jnp.asarray(batch["input_ids"])
         labels = jnp.asarray(batch["labels"])
         to_use, key = jr.split(key)
+
+        # Logging message.
+        tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
+        samples = labels.shape[0]
+        time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
 
         # Apply one-step train_step.
         loss, accuracy, log_data, train_state = train_step_jit(
@@ -277,7 +362,7 @@ def train(config: DictConfig) -> None:
 
     # Initialize model, optimizer, and loss.
     model = GPT(tokenizer.vocab_size, config.model, key=jr.PRNGKey(42))
-    optimizer, opt_state = init_optimizer(model, config.train, logger=limited_log)
+    optimizer, opt_state = init_optimizer(model, config, logger=limited_log)
 
     if config.train.use_amp:
         dynamic_scaler_state = DynamicScalerState()
