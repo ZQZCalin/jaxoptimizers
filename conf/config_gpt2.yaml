@@ -49,19 +49,24 @@ optimizer:
   lr_schedule: "cosine"
   lr_warmup: 5000
 
-  # whether to use exponentiated o2nc (True) or standard o2nc (False) as the wrapper
-  use_eo2nc: True
-  beta: 0.99
-  mu: 100.0
+  # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
+  wrap_o2nc: null
 
   # PRNGKey seed for random scaling
   seed: 0
 
   # base online learner
-  online_learner: "unconstrained_ogd"
+  online_learner: "ada_ftrl"
+  ol_config:
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    scale_exponential: False 
+    scale_lr: False 
+    scale_eps: False
 
 benchmark:
-  # if true, uses optax.adamw
+  # if true, uses optax.adamw. should always set to False.
   use_default: False
 
   lr: 1e-4

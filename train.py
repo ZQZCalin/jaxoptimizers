@@ -33,7 +33,7 @@ from loader.c4_loader import get_c4_loader_next_token
 import sys
 sys.path.append('./optimizers')
 from optimizers.o2nc import o2nc, eo2nc, adamw
-from optimizers.online_learners import unconstrained_ogd
+from optimizers.online_learners import unconstrained_ogd, ada_ftrl
 
 
 class TrainState(NamedTuple):
@@ -121,6 +121,20 @@ def init_scheduler(
     return learning_rate
 
 
+def lr_wrapper(
+    learning_rate: optax.ScalarOrSchedule,
+    count: int,
+    logger: None
+):
+    if callable(learning_rate):
+        lr = learning_rate(count)
+    else:
+        lr = learning_rate
+    if logger is not None:
+        jax.experimental.io_callback(logger, None, {"lr/schedule": lr}, commit=False)
+    return lr
+
+
 def init_optimizer(
     model: eqx.Module,
     config: DictConfig,
@@ -144,6 +158,10 @@ def init_optimizer(
     
     # Learning rate scheduler.
     learning_rate = init_scheduler(max_steps, config)
+
+    # Log learning rate to wandb.
+    learning_rate = jtu.Partial(
+        lr_wrapper, learning_rate, logger=logger)
     
     if run_benchmark:
         # Run Adamw as the benchmark
@@ -166,17 +184,21 @@ def init_optimizer(
     else:
         # Base online learner.
         if config.online_learner == "unconstrained_ogd":
-            online_learner = unconstrained_ogd(
+            optimizer = unconstrained_ogd(
                 learning_rate=learning_rate,
-                beta=config.beta,
-                mu=config.mu
+                **config.ol_config
+            )
+        elif config.online_learner == "ada_ftrl":
+            optimizer = ada_ftrl(
+                learning_rate=learning_rate,
+                **config.ol_config
             )
 
         # Wrap base online learner with (Exponentiated) O2NC.
-        if config.use_eo2nc:
-            optimizer = eo2nc(online_learner, config.seed)
-        else:
-            optimizer = o2nc(online_learner, config.seed)
+        if config.wrap_o2nc == "o2nc":
+            optimizer = o2nc(optimizer, config.seed)
+        elif config.wrap_o2nc == "eo2nc":
+            optimizer = eo2nc(optimizer, config.seed)
 
     # Gradient clipping and NaN wrapper.
     grad_clip = optax.clip_by_global_norm(gradient_clip_val)

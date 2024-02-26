@@ -21,6 +21,10 @@ outputs/
 # wandb log files
 wandb/
 
+# batch job and output files
+batch_job.sh
+batch_job.sh.*
+
 # other directories
 opt/
 mechanic.py

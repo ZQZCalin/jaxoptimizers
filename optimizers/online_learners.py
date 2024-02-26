@@ -32,7 +32,7 @@ from jax import random as jr
 from jax import tree_util as jtu
 import chex
 import optax
-from optax import Updates, OptState, GradientTransformation
+from optax import Updates, OptState, ScalarOrSchedule, GradientTransformation
 from typing import Any, Tuple, NamedTuple, Optional
 import sys
 sys.path.append('../jaxoptimizers')
@@ -175,13 +175,135 @@ def unconstrained_ogd(
     return GradientTransformation(init_fn, update_fn)
 
 
+class AdaFTRLState(NamedTuple):
+    """Adaptive FTRL State."""
+    count: chex.Array
+    mu: Updates
+    nu: Updates
+
+
+def ada_ftrl(
+    learning_rate: ScalarOrSchedule,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    scale_exponential: bool = False,
+    scale_lr: bool = False,
+    scale_eps: bool = False,
+) -> GradientTransformation:
+    """Ada-FTRL.
+
+    See notes for the update.
+
+    **Note:** with scale_exponential = False, this algorithm is almost Adam, up to two differences:
+        - mu and nu are not debiased;
+        - eps is scaled by an exponential decay beta2**(t/2).
+
+    Args:
+        learning_rate (ScalarOrSchedule): _description_
+        beta1 (float, optional): _description_. Defaults to 0.9.
+        beta2 (float, optional): _description_. Defaults to 0.999.
+        eps (float, optional): _description_. Defaults to 1e-8.
+        scale_exponential (bool, optional): If true, scale the update by (sqrt(beta2)/beta1)**t. Defaults to False.
+        scale_lr (bool, optional): If true, scale the learning rate by sqrt(1-beta2)/(1-beta1). Defaults to False.
+        scale_eps (bool, optional): If true, scale eps by sqrt(1-beta2). Defaults to False.
+
+    Returns:
+        A `GradientTransformation` object.
+    """
+
+    if scale_lr:
+        scale_lr_const = (1-beta2)**.5 / (1-beta1)
+        if callable(learning_rate):
+            learning_rate = lambda n: scale_lr_const * learning_rate(n)
+        else:
+            learning_rate *= scale_lr_const
+    
+    if scale_eps:
+        eps *= (1-beta2)**.5
+
+    def init_fn(params):
+        return AdaFTRLState(
+            count=jnp.zeros([], jnp.int32),
+            mu=jtu.tree_map(jnp.zeros_like, params),
+            nu=jtu.tree_map(jnp.zeros_like, params)
+        )
+    
+    def update_fn(updates, state, params=None):
+        del params
+        mu = jtu.tree_map(
+            lambda m, g: beta1*m + (1-beta1)*g, state.mu, updates)
+        nu = jtu.tree_map(
+            lambda v, g: beta2*v + (1-beta2)*g**2, state.nu, updates)
+        if scale_exponential:
+            scalar = (beta2**.5/beta1)**state.count
+        else:
+            scalar = 1
+        if callable(learning_rate):
+            eta = learning_rate(state.count)
+        else:
+            eta = learning_rate
+        Delta = jtu.tree_map(
+            lambda m, v: -scalar * eta * m / (beta2**(state.count/2)*eps + jnp.sqrt(v)),
+            mu, nu)
+        return Delta, AdaFTRLState(
+            count=optax.safe_int32_increment(state.count), mu=mu, nu=nu)
+    
+    return GradientTransformation(init_fn, update_fn)
+
+
 def adagrad() -> GradientTransformation:
     return
 
 
-def ogd_from_omd() -> GradientTransformation:
-    return
+class KTBetterState(NamedTuple):
+    """KT coin better state."""
+    sum_grad: float
+    wealth: float
 
+
+def kt_better(
+    eps: float = 1.0,
+) -> GradientTransformation:
+    
+    def init_fn(params=None):
+        del params
+        return KTBetterState(sum_grad=.0, wealth=eps)
+    
+    def update_fn(updates, state, params):
+        return 
+    
+    return 
+
+
+class BlackBoxReductionState(NamedTuple):
+    """Black box reduction state."""
+    magnitude_state: OptState
+    direction_state: OptState
+
+
+def black_box_reduction(
+    magnitude_learner: GradientTransformation,
+    direction_learner: GradientTransformation,
+) -> GradientTransformation:
+    
+    def init_fn(params):
+        magnitude_state = magnitude_learner.init(params)
+        direction_state = direction_learner.init(
+            jtu.tree_map(jnp.zeros_like, params))
+        return BlackBoxReductionState(
+            magnitude_state=magnitude_state,
+            direction_state=direction_state
+        )
+    
+    def update_fn(updates, state, params):
+        xt, magnitude_state = magnitude_learner.update(
+            updates, state.magnitude_state, params)
+        zt, direction_state = direction_learner.update()
+        updates = jtu.tree_map()
+        return updates, BlackBoxReductionState()
+    
+    return GradientTransformation(init_fn, update_fn)
 
 def cocob() -> GradientTransformation:
     return
