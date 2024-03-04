@@ -255,10 +255,10 @@ def train_step(
     # Log training info.
     accuracy = get_accuracy(logits, batch)
 
-    log_data = {"grads/norm": tree_norm(grads)}
-
-    if isinstance(opt_state, optax.contrib.MechanicState):
-        log_data["mechanic/s"] = jnp.sum(opt_state.s)
+    # TODO: log effective learning rate and lr * grad
+    log_data = {
+        "grads/norm": tree_norm(grads)
+    }
 
     return loss, accuracy, log_data, new_train_state
 

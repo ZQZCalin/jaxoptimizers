@@ -7,6 +7,8 @@ from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
 import ml_dtypes
 
 
+# Util functions for tree manipulation. 
+
 def tree_add(tree1, tree2):
     return jtu.tree_map(lambda x,y: x+y, tree1, tree2)
 
@@ -15,8 +17,44 @@ def tree_subtract(tree1, tree2):
     return jtu.tree_map(lambda x,y: x-y, tree1, tree2)
 
 
+def tree_multiply(tree1, tree2):
+    return jtu.tree_map(lambda x,y: x*y, tree1, tree2)
+
+
+def tree_dot(tree1, tree2):
+    return jtu.tree_reduce(
+        lambda x,y: x+y,
+        jtu.tree_map(lambda x,y: jnp.dot(x,y), tree1, tree2)
+    )
+
+
 def tree_scalar_multiply(tree, scalar):
     return jtu.tree_map(lambda x: scalar*x, tree)
+
+
+def tree_norm(tree):
+    return jnp.sqrt(
+        jtu.tree_reduce(
+            lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
+        )
+    )
+
+
+def tree_normalize(tree):
+    return tree_scalar_multiply(tree, 1/tree_norm(tree))
+
+
+def check_tree_structures_match(tree1, tree2):
+    """Check whether tree1 and tree2 have the same tree structure. 
+    Raises error when structures do not match.
+
+    Args:
+        tree1 (Pytree): First input.
+        tree2 (Pytree): Second input.
+    """
+    err_msg = "Input Pytrees do not have the same structure"
+    is_match = jtu.tree_structure(tree1) == jtu.tree_structure(tree2)
+    assert is_match, err_msg
 
 
 def get_accuracy(logits: Array, batch: Tuple[Array], ignore_index: int = -100):
@@ -31,14 +69,6 @@ def get_dtype(dtype: str):
         "float16": jnp.float16,
     }
     return registry[dtype.lower()]
-
-
-def tree_norm(tree):
-    return jnp.sqrt(
-        jtu.tree_reduce(
-            lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
-        )
-    )
 
 
 # TODO: This is hella slow. Needs better solution

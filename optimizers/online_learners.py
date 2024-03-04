@@ -1,29 +1,24 @@
-"""Online convex optimization algorithms for (Exponentiated) O2NC.
+"""Online convex optimization algorithms.
 
-update_fn for standard O2NC:
+Please be aware that online learners have different init_fn and update_fn behavior.
+
+update_fn(updates, state, params):
     Args:
-        updates: A pytree of gradients g_t.
-        state:
-        params:
+        updates: Gradients g_t.
+        state: Current state.
+        params: Current parameter w_t.
+            **Note:**
     
     Returns: 
-        Delta_t that minimizes the regret w.r.t. the linear loss
-        $$
-        \ell_t(Delta) = <g_t, Delta>.
-        $$
+        A new parameter w_{t+1} and a new state.
+        **Note:** Online learners return new parameters unlike typical GradientTransformations that return updates.
+        The reason is that most online learners (mirror descent, FTRL, parameter-free algorithms, etc.) do not have 
+        an iterative update expression such as w_{t+1} = w_t + XXX. Hence, it would be easier to directly return the
+        new parameter instead of new_params - params.
 
-update_fn for Exponentiated O2NC:
-    Args:
-        # updates: A pytree of tuple (g_t, beta_t, mu_t).
-        updates: A pytree of gradients g_t
-        state:
-        params:
-    
-    Returns: 
-        Delta_t that minimizes the regret w.r.t. the exponentiated and regularized loss
-        $$
-        \ell_t(Delta) = <beta_t*g_t, Delta> + mu_t/2*||Delta||^2.
-        $$
+Currently the following list of functions follow this format:
+    - `ada_ftrl`
+    - `kt_bettor`
 """
 
 import jax
@@ -32,11 +27,49 @@ from jax import random as jr
 from jax import tree_util as jtu
 import chex
 import optax
-from optax import Updates, OptState, ScalarOrSchedule, GradientTransformation
-from typing import Any, Tuple, NamedTuple, Optional
+from optax import Updates, Params, OptState, ScalarOrSchedule, GradientTransformation
+from typing import Any, Tuple, NamedTuple, Optional, Union, Callable, Protocol
 import sys
 sys.path.append('../jaxoptimizers')
-from util import tree_scalar_multiply
+from util import tree_add, tree_subtract, tree_multiply, tree_scalar_multiply, tree_norm, tree_normalize, check_tree_structures_match
+
+
+# Q: should we allow online learners to decide their initial parameter?
+class OnlineLearnerInitFn(Protocol):
+    def __call__(self, params: Params) -> Tuple[Params, OptState]:
+    # def __call__(self, params: Params) -> OptState:
+        """The `init` function.
+
+        Args:
+            params: The model parameter, which can be different than the online learner initial parameter.
+
+        Returns:
+            The initial parameter and the initial state of the online learner.
+        """
+
+
+class OnlineLearnerUpdateFn(Protocol):
+    def __call__(
+        self, 
+        grads: Updates, 
+        state: OptState, 
+        params: Optional[Params]
+    ) -> Tuple[Params, OptState]:
+        """The `update` function.
+
+        Args:
+            grads: A tree of gradients.
+            state: The state of the online learner.
+            params: (Optionally) the current parameters w_t.
+
+        Returns:
+            The new parameter w_{t+1}, and the updated state.
+        """
+
+
+class OnlineLearner(NamedTuple):
+    init: OnlineLearnerInitFn
+    update: OnlineLearnerUpdateFn
 
 
 class ScaleByOnlineLearnerState(NamedTuple):
@@ -98,6 +131,80 @@ def scale_by_online_learner(
         return Delta, ScaleByOnlineLearnerState(
             Delta=Delta, opt_state=opt_state)
     
+    return GradientTransformation(init_fn, update_fn)
+
+
+# Next, we also provide a more general wrapper for online learners.
+# If you want to use an online learner as part of a larger optimizer (say O2NC), just
+# wrap the online learner with this wrapper.
+class OnlineLearnerWrapperState(NamedTuple):
+    """online learner wrapper state."""
+    params: Updates 
+    state: OptState
+
+
+def online_learner_wrapper(
+    online_learner: GradientTransformation,
+    init_params: Params = None,
+) -> GradientTransformation:
+    """A wrapper for online learenr if it's used as part of the optimizer (e.g., O2NC).
+    The wrapper automatically stores the params of the online learner, which may be different than the actual
+    model parameter, and calls online_learner.update() in each step.
+
+    Args:
+        online_learner: _description_
+        init_params: Initial parameters of the online learner. Defaults to an all-zero tree.
+
+    Returns:
+        GradientTransformation: _description_
+    """
+
+    def init_fn(params):
+        new_params = jtu.tree_map(jnp.zeros_like, params) if init_params is None else init_params
+        return OnlineLearnerWrapperState(
+            params=new_params,
+            state=online_learner.init(new_params)
+        )
+    
+    def update_fn(updates, state, params=None):
+        del params
+        new_params, state = online_learner.update(updates, state.state, state.params)
+        return OnlineLearnerWrapperState(params=new_params, state=state)
+
+    return GradientTransformation(init_fn, update_fn)
+
+
+# This wrapper is designed specifically for exponentiated O2NC (ER stands for exponentiated and regularized).
+class EROnlineLearnerWrapperState(NamedTuple):
+    params: Updates
+    state: OptState
+    count: chex.Array
+
+
+# TODO: implement its update
+def er_online_learner_wrapper(
+    online_learner: GradientTransformation,
+    init_params: Callable[[chex.Array], chex.Array] = jnp.zeros_like,
+    beta: float = 1.0,
+    mu: float = 0.0,
+) -> GradientTransformation:
+    """Wraps the online learner with exponentiated and regularized loss:
+    <beta^-t gt, w> + mut/2 |w|^2 ==> gradient = beta^-t * (gt + mu*wt)
+    """
+    
+    def init_fn(params):
+        params = jtu.tree_map(init_params, params)
+        return OnlineLearnerWrapperState(
+            params=params,
+            state=online_learner.init(params),
+            count=jnp.ones([], jnp.int32)
+        )
+    
+    def update_fn(updates, state, params=None):
+        del params
+        params, state = online_learner.update(updates, state.state, state.params)
+        return OnlineLearnerWrapperState(params=params, state=state)
+
     return GradientTransformation(init_fn, update_fn)
 
 
@@ -256,54 +363,147 @@ def adagrad() -> GradientTransformation:
     return
 
 
-class KTBetterState(NamedTuple):
+class KTBettorState(NamedTuple):
     """KT coin better state."""
-    sum_grad: float
-    wealth: float
+    sum_grad: Updates
+    wealth: Updates
+    count: chex.Array
 
 
-def kt_better(
-    eps: float = 1.0,
+def kt_bettor(
+    eps: Union[float, Any] = 1e2,
 ) -> GradientTransformation:
-    
-    def init_fn(params=None):
-        del params
-        return KTBetterState(sum_grad=.0, wealth=eps)
+    """KT Coin Bettor.
+
+    Note:
+        By default, if dimension is higher than 1, then implements per-coordinate KT coin bettor.
+
+    References:
+        [Orabona, 2019, Alg. 9.2](https://arxiv.org/abs/1912.13213)
+
+    Args:
+        eps (float or Pytree): Initial wealth between 1 and sqrt(T). Defaults to 1.0.
+
+    Returns:
+        A `GradientTransformation` object.
+    """
+
+    def init_fn(params):
+        sum_grad = jtu.tree_map(jnp.zeros_like, params)
+        if type(eps) != float:
+            # eps as a Pytree. Will check if eps and params have the same tree structure.
+            check_tree_structures_match(eps, params)
+            wealth = eps
+        else:
+            wealth = jtu.tree_map(lambda p: jnp.full_like(p, eps), params)
+        return KTBettorState(
+            sum_grad=sum_grad,
+            wealth=wealth,
+            count=jnp.ones([], jnp.int32)
+        )
     
     def update_fn(updates, state, params):
-        return 
+        count_inc = optax.safe_int32_increment(state.count)
+        sum_grad = tree_add(state.sum_grad, updates)
+        wealth = tree_subtract(state.wealth, tree_multiply(updates, params))
+        new_params = jtu.tree_map(
+            lambda St, Wt: - St / count_inc * Wt, sum_grad, wealth)
+        return new_params, KTBettorState(
+            sum_grad=sum_grad, wealth=wealth, count=count_inc)
     
-    return 
+    return GradientTransformation(init_fn, update_fn)
 
 
-class BlackBoxReductionState(NamedTuple):
+class BlackboxERFTRLState(NamedTuple):
+    """Black box FTRL state."""
+    momentum: Updates
+
+
+def blackbox_er_ftrl(
+    beta: float = 1.0,
+    mu: float = 0.0,
+) -> GradientTransformation:
+    
+    assert beta >= 0 and beta <= 1, "beta must be between 0 and 1."
+
+    def init_fn(params):
+        return BlackboxERFTRLState(momentum=jtu.tree_map(jnp.zeros_like, params))
+    
+    def update_fn(updates, state, params):
+        if beta == 1.0:
+            momentum = jtu.tree_map(
+                lambda m, g, w: m - (g+mu*w), state.momentum, updates, params)
+        else:
+            momentum = jtu.tree_map(
+                lambda m, g, w: beta*m - (1-beta)*(g+mu*w), state.momentum, updates, params)
+        return tree_normalize(momentum), BlackboxERFTRLState(momentum)
+
+    return GradientTransformation(init_fn, update_fn)
+
+
+class BlackboxReductionState(NamedTuple):
     """Black box reduction state."""
     magnitude_state: OptState
     direction_state: OptState
 
 
-def black_box_reduction(
+def blackbox_reduction(
     magnitude_learner: GradientTransformation,
     direction_learner: GradientTransformation,
+    # global_scaling: bool = True
 ) -> GradientTransformation:
+    """Black-box reduction algorithm.
+
+    References:
+        [Cutkosky & Orabona, 2018](https://arxiv.org/abs/1802.06293)
+
+    Args:
+        magnitude_learner (GradientTransformation): 
+            Online learner (typically parameter-free algorithms) for magnitude; learns :math:`\|x_t\|`.
+        direction_learner (GradientTransformation): 
+            Online learner for direction; learns :math:`x_t / \|x_t\|`.
+        global_scaling (bool, optional): 
+            If true, there is one global learning rate scalar for all parameters; 
+            Otherwise, each tree node has each own lr scalar. Defaults to True.
+            For now, I DONT plan to implement global scaling.
+
+    Returns:
+        A `GradientTransformation` object.
+    """
     
     def init_fn(params):
-        magnitude_state = magnitude_learner.init(params)
-        direction_state = direction_learner.init(
-            jtu.tree_map(jnp.zeros_like, params))
-        return BlackBoxReductionState(
+        params_norm = tree_norm(params)
+        if params_norm == 0.:
+            direction_params = params
+        else:
+            direction_params = tree_scalar_multiply(params, 1/params_norm)
+        direction_state = direction_learner.init(direction_params)
+        magnitude_state = magnitude_learner.init(params_norm)
+        # Note: In the first iterate, last_iterate is initialized as params, the initial parameter 
+        # of the model, where g1 is evaluated.
+        return BlackboxReductionState(
             magnitude_state=magnitude_state,
             direction_state=direction_state
         )
     
     def update_fn(updates, state, params):
-        xt, magnitude_state = magnitude_learner.update(
-            updates, state.magnitude_state, params)
-        zt, direction_state = direction_learner.update()
-        updates = jtu.tree_map()
-        return updates, BlackBoxReductionState()
+        st = jnp.array(
+            jtu.tree_reduce(
+                lambda x, y: x + y,
+                jtu.tree_map(lambda g, w: jnp.dot(g, w), updates, params)))
+        xt, direction_state = direction_learner.update(
+            updates, state.direction_state, params)
+        # TODO: change param to 1D params
+        zt, magnitude_state = magnitude_learner.update(
+            st, state.magnitude_state, params)
+        new_params = jtu.tree_map(lambda z, x: z*x, zt, xt)
+        return new_params, BlackboxReductionState(
+            magnitude_state=magnitude_state,
+            direction_state=direction_state
+        )
     
     return GradientTransformation(init_fn, update_fn)
+
 
 def cocob() -> GradientTransformation:
     return
@@ -315,3 +515,33 @@ def dog() -> GradientTransformation:
 
 def pfmd() -> GradientTransformation:
     return
+
+
+# =============== TESTING ===============
+def test_online_learner(
+    online_learner: GradientTransformation,
+):
+    # Simple pytree for testing
+    grads = {
+        'a': [jnp.array(1.), jnp.array(2.)],  # List of arrays
+        'b': (jnp.array(3.), jnp.array(4.)),  # Tuple of arrays
+        'c': {'d': jnp.array(5.)}  # Nested dictionary with an array
+    }
+    params = jtu.tree_map(jnp.zeros_like, grads)
+    print("initial params:\n", params)
+    
+    opt_state = online_learner.init(params)
+    params, opt_state = online_learner.update(grads, opt_state, params)
+    print("new params:\n", params)
+
+
+if __name__ == "__main__":
+    magnitude = kt_bettor()
+    direction = blackbox_er_ftrl(beta=1.0, mu=0.0)
+    blackbox = blackbox_reduction(magnitude, direction)
+
+    # test_online_learner(magnitude)
+    # test_online_learner(online_learner_wrapper(magnitude))
+    # test_online_learner(direction)
+    # test_online_learner(online_learner_wrapper(direction))
+    test_online_learner(blackbox)
