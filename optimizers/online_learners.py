@@ -452,8 +452,6 @@ def blackbox_reduction(
     def update_fn(updates, state, params=None):
         del params
         zt, xt = state.magnitude_params, state.direction_params
-        jax.debug.print(">>>>>>>>>>>>>>>>>>>>>>>")
-        jax.debug.print("magnitude {x}", x=zt)
         params = tree_scalar_multiply(xt, zt)
         st = util.tree_inner_product(updates, xt) + weight_decay * zt
         gt_tilde = jtu.tree_map(

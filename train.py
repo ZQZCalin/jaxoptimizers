@@ -26,13 +26,15 @@ import hydra
 from omegaconf import OmegaConf, DictConfig
 
 from util import softmax_cross_entropy, tree_norm, get_accuracy, get_dtype
+import logstate
 from logger import TimeKeeper, RateLimitedWandbLog
 from model.gpt import GPT
 from loader.c4_loader import get_c4_loader_next_token
 
 import sys
 sys.path.append('./optimizers')
-from optimizers.o2nc import o2nc, eo2nc, adamw
+from optimizers.o2nc import o2nc, eo2nc, adamw, online_nonconvex
+import optimizers.online_learners as ol
 from optimizers.online_learners import unconstrained_ogd, ada_ftrl
 
 
@@ -153,52 +155,74 @@ def init_optimizer(
     """
     max_steps = config.train.max_steps
     gradient_clip_val = config.train.gradient_clip_val
-    run_benchmark = config.train.run_benchmark
-    config = config.benchmark if run_benchmark else config.optimizer
+    run_benchmark = config.benchmark.run_benchmark
     
     # Learning rate scheduler.
-    learning_rate = init_scheduler(max_steps, config)
+    lr_config = config.benchmark if run_benchmark else config.optimizer
+    learning_rate = init_scheduler(max_steps, lr_config)
 
-    # Log learning rate to wandb.
+    # Wrap scheduler to log learning rate to wandb.
     learning_rate = jtu.Partial(
         lr_wrapper, learning_rate, logger=logger)
     
     if run_benchmark:
         # Run Adamw as the benchmark
-        if config.use_default:
+        benchmark_config = config.benchmark
+        if benchmark_config.use_default:
             optimizer = optax.adamw(
                 learning_rate=learning_rate,
-                b1=config.beta1,
-                b2=config.beta2,
-                weight_decay=config.weight_decay,
+                b1=benchmark_config.beta1,
+                b2=benchmark_config.beta2,
+                weight_decay=benchmark_config.weight_decay,
             )
         else:
             optimizer = adamw(
                 learning_rate=learning_rate,
-                beta1=config.beta1,
-                beta2=config.beta2,
-                weight_decay=config.weight_decay,
-                debias_beta1=config.debias_beta1,
-                debias_beta2=config.debias_beta2
+                beta1=benchmark_config.beta1,
+                beta2=benchmark_config.beta2,
+                weight_decay=benchmark_config.weight_decay,
+                debias_beta1=benchmark_config.debias_beta1,
+                debias_beta2=benchmark_config.debias_beta2,
             )
     else:
-        # Base online learner.
-        if config.online_learner == "unconstrained_ogd":
-            optimizer = unconstrained_ogd(
+        # Run online-to-nonconvex conversion.
+        optim_config = config.optimizer
+        ol_config = config.optimizer.ol_config
+        if optim_config.online_learner == "unconstrained_ogd":
+            online_learner = unconstrained_ogd(
                 learning_rate=learning_rate,
-                **config.ol_config
+                **ol_config
             )
-        elif config.online_learner == "ada_ftrl":
-            optimizer = ada_ftrl(
+        elif optim_config.online_learner == "ada_ftrl":
+            online_learner = ada_ftrl(
                 learning_rate=learning_rate,
-                **config.ol_config
+                **ol_config
+            )
+        elif optim_config.online_learner == "blackbox_ftrl":
+            online_learner = ol.blackbox_reduction(
+                magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
+                direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
+                weight_decay=ol_config.weight_decay,
             )
 
+        # Random scaling function.
+        exponential_scaling = lambda key: jr.exponential(key)
+        uniform_scaling = lambda key: jr.uniform(key, minval=0, maxval=2)
+
+        if optim_config.random_scaling == "exponential":
+            random_scaling = exponential_scaling
+        elif optim_config.random_scaling == "uniform":
+            random_scaling = uniform_scaling
+
         # Wrap base online learner with (Exponentiated) O2NC.
-        if config.wrap_o2nc == "o2nc":
-            optimizer = o2nc(optimizer, config.seed)
+        if optim_config.wrap_o2nc == "o2nc":
+            optimizer = online_nonconvex(
+                online_learner=online_learner,
+                random_scaling=random_scaling,
+                seed=optim_config.seed,
+            )
         elif config.wrap_o2nc == "eo2nc":
-            optimizer = eo2nc(optimizer, config.seed)
+            optimizer = eo2nc(online_learner, config.seed)
 
     # Gradient clipping and NaN wrapper.
     grad_clip = optax.clip_by_global_norm(gradient_clip_val)
@@ -259,6 +283,7 @@ def train_step(
     log_data = {
         "grads/norm": tree_norm(grads)
     }
+    log_data.update(logstate.list_of_logs(opt_state))
 
     return loss, accuracy, log_data, new_train_state
 

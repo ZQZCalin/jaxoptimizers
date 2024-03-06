@@ -14,9 +14,6 @@ train:
   # clip the gradient to have l2 norm at most this value
   gradient_clip_val: 10.0
 
-  # if true, runs adamw benchmark.
-  run_benchmark: False
-
   # whether to use automatic mixed precision
   use_amp: True
   # value to cast to in mixed precision training.
@@ -49,10 +46,18 @@ optimizer:
   lr_warmup: 5000
 
   # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
-  wrap_o2nc: "eo2nc"
+  wrap_o2nc: "o2nc"
 
   # PRNGKey seed for random scaling
   seed: 0
+
+  # random scaling function. values in ["exponential", ...]
+  random_scaling: "exponential"
+
+  # regularization constants 
+  # NOTE: exponentiation should be specified in online learner since each online learner
+  # implements exponentiated gradient in its own way.
+  # weight_decay: 0.01
 
   # base online learner. currently supports
   # ["unconstrained_ogd", "ada_ftrl", "blackbox_ftrl"]
@@ -69,12 +74,15 @@ optimizer:
   online_learner: "blackbox_ftrl"
   ol_config:
     magnitude_learner: "kt"
-    eps: 100
+    eps: 10
     beta: 0.999
     weight_decay: 0.01
 
 
 benchmark:
+  # if true, runs adamw benchmark.
+  run_benchmark: False
+
   # if true, uses optax.adamw. should always set to False.
   use_default: False
 

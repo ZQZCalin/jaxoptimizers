@@ -6,13 +6,14 @@ from jax import random as jr
 from jax import tree_util as jtu
 import chex
 import optax
-from optax import Updates, OptState, ScalarOrSchedule, GradientTransformation
+from optax import Updates, Params, OptState, ScalarOrSchedule, GradientTransformation
 from typing import Any, Tuple, NamedTuple, Optional, Callable
 from online_learners import OnlineLearner, unconstrained_ogd
 import sys
 sys.path.append('../jaxoptimizers')
 from util import tree_add, tree_subtract, tree_scalar_multiply, tree_norm
 from logger import RateLimitedWandbLog
+import logstate
 
 
 SampleFunction = Callable[[chex.Array], chex.Numeric]
@@ -215,6 +216,78 @@ def exponentiate_loss(
     return GradientTransformation(init_fn, update_fn)
 
 
+class OnlineNonconvexState(NamedTuple):
+    """online to nonconvex state."""
+    ol_params: Params
+    ol_state: OptState
+    key: chex.Array
+    logging: logstate.Log
+
+
+def online_nonconvex(
+    online_learner: OnlineLearner,
+    random_scaling: SampleFunction = None,
+    seed: int = 0,
+) -> GradientTransformation:
+    """General Online-to-non-convex conversion.
+
+    For simplicity of logging message, this function combines `scale_by_random` and `wrap_online_learner`.
+    See documentations of the two functions for more details.
+
+    Args:
+        online_learner: Online learner subroutine.
+        random_scaling: Function to sample random scalar. Defaults to exponential scaling.
+        seed: PRNGKey to generate random scalar.
+    """
+    
+    # Scaling defaults to exponential scaling.
+    exponential_scaling = lambda key: jr.exponential(key)
+    if random_scaling is None:
+        random_scaling = exponential_scaling
+    
+    def init_fn(params):
+        # NOTE: For now, I assume online learner parameters are always initialized to zeros.
+        ol_params = jtu.tree_map(jnp.zeros_like, params)
+        ol_state = online_learner.init(ol_params)
+        key = jr.PRNGKey(seed)
+        logging = logstate.Log(
+            {
+                "update/random_scaling": 0.0,
+                "update/norm_pre_scaling": 0.0,
+                "update/norm_post_scaling": 0.0,
+            }
+        )
+        return OnlineNonconvexState(
+            ol_params=ol_params,
+            ol_state=ol_state, 
+            key=key, 
+            logging=logging
+        )
+    
+    def update_fn(updates, state, params=None):
+        del params
+        # Update online learner.
+        ol_params, ol_state = online_learner.update(updates, state.ol_state, state.ol_params)
+        norm_pre_scaling = tree_norm(ol_params)
+        # Apply random scaling.
+        key, new_key = jr.split(state.key)
+        scaling = random_scaling(key)
+        new_updates = tree_scalar_multiply(ol_params, scaling)
+        norm_post_scaling = scaling * norm_pre_scaling
+        return new_updates, OnlineNonconvexState(
+            ol_params=ol_params,
+            ol_state=ol_state,
+            key=new_key,
+            logging={
+                "update/random_scaling": scaling,
+                "update/norm_pre_scaling": norm_pre_scaling,
+                "update/norm_post_scaling": norm_post_scaling,
+            }
+        )
+    
+    return GradientTransformation(init_fn, update_fn)
+
+
 def eo2nc(
     online_learner: GradientTransformation,
     sample_fn: SampleFunction,
@@ -236,23 +309,6 @@ def eo2nc(
     return optax.chain(
         online_learner,
         random_scaling
-    )
-
-
-# Wrapped optimizers from O2NC
-def eo2nc_unconstrained_ogd(
-    learning_rate: ScalarOrSchedule,
-    beta: float = 0.99,
-    mu: float = 100.0,
-    seed: int = 0,
-) -> GradientTransformation:
-    return optax.chain(
-        unconstrained_ogd(
-            learning_rate=learning_rate,
-            beta=beta,
-            mu=mu
-        ),
-        scale_by_exponential(seed=seed)
     )
 
 
