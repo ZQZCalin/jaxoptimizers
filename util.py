@@ -28,6 +28,12 @@ def tree_dot(tree1, tree2):
     )
 
 
+def tree_inner_product(tree1, tree2):
+    leaves1, _ = jtu.tree_flatten(tree1)
+    leaves2, _ = jtu.tree_flatten(tree2)
+    return sum(jnp.sum(a * b) for a, b in zip(leaves1, leaves2))
+
+
 def tree_scalar_multiply(tree, scalar):
     return jtu.tree_map(lambda x: scalar*x, tree)
 
@@ -42,6 +48,19 @@ def tree_norm(tree):
 
 def tree_normalize(tree):
     return tree_scalar_multiply(tree, 1/tree_norm(tree))
+
+
+def tree_norm_direction_decomposition(tree):
+    """Decomposes the norm and the direction of a tree.
+
+    Returns:
+        The norm of a tree (1d array) and the normalized tree.
+        If the tree is all zeros, then return 0 as the norm and an all-zero tree.
+    """
+    norm = tree_norm(tree)
+    if norm == 0:
+        return 0, tree
+    return norm, tree_scalar_multiply(tree, 1/norm)
 
 
 def check_tree_structures_match(tree1, tree2):

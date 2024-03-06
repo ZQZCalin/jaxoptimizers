@@ -14,15 +14,14 @@ train:
   # clip the gradient to have l2 norm at most this value
   gradient_clip_val: 10.0
 
-  # if true, runs adamw benchmark
-  run_benchmark: True
+  # if true, runs adamw benchmark.
+  run_benchmark: False
 
   # whether to use automatic mixed precision
   use_amp: True
   # value to cast to in mixed precision training.
   precision: float16
   
-  weight_decay: 0.01
   batch_size: 4 # number of examples placed on each GPU
 
   wandb_project: "o2nc_opt"
@@ -50,20 +49,30 @@ optimizer:
   lr_warmup: 5000
 
   # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
-  wrap_o2nc: null
+  wrap_o2nc: "eo2nc"
 
   # PRNGKey seed for random scaling
   seed: 0
 
-  # base online learner
-  online_learner: "ada_ftrl"
+  # base online learner. currently supports
+  # ["unconstrained_ogd", "ada_ftrl", "blackbox_ftrl"]
+  # Ada-FTRL
+  # online_learner: "ada_ftrl"
+  # ol_config:
+  #   beta1: 0.9
+  #   beta2: 0.999
+  #   eps: 1e-8
+  #   scale_exponential: False 
+  #   scale_lr: False 
+  #   scale_eps: False
+  # Blackbox FTRL
+  online_learner: "blackbox_ftrl"
   ol_config:
-    beta1: 0.9
-    beta2: 0.999
-    eps: 1e-8
-    scale_exponential: False 
-    scale_lr: False 
-    scale_eps: False
+    magnitude_learner: "kt"
+    eps: 100
+    beta: 0.999
+    weight_decay: 0.01
+
 
 benchmark:
   # if true, uses optax.adamw. should always set to False.

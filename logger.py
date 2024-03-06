@@ -66,8 +66,6 @@ class TimeKeeper:
 
 class RateLimitedWandbLog:
     """Implements a Wandb logger object.
-    
-    Q: how it works?
     """
     def __init__(self, max_frequency=1.0):
         self.max_frequency = max_frequency

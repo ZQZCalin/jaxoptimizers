@@ -8,10 +8,11 @@ import chex
 import optax
 from optax import Updates, OptState, ScalarOrSchedule, GradientTransformation
 from typing import Any, Tuple, NamedTuple, Optional, Callable
-from online_learners import unconstrained_ogd
+from online_learners import OnlineLearner, unconstrained_ogd
 import sys
 sys.path.append('../jaxoptimizers')
-from util import tree_add, tree_subtract, tree_scalar_multiply
+from util import tree_add, tree_subtract, tree_scalar_multiply, tree_norm
+from logger import RateLimitedWandbLog
 
 
 SampleFunction = Callable[[chex.Array], chex.Numeric]
@@ -216,8 +217,7 @@ def exponentiate_loss(
 
 def eo2nc(
     online_learner: GradientTransformation,
-    # beta: float = 0.99,
-    # mu: float = 100.0,
+    sample_fn: SampleFunction,
     seed: int = 0,
 ) -> GradientTransformation:
     """Exponentiated Online-to-non-convex Conversion.
@@ -227,23 +227,16 @@ def eo2nc(
 
     Args:
         online_learner (GradientTransformation): Online convex optimization algorithm.
-        # beta (float): Exponential constant. Defaults to 0.99.
-        # mu (float): Regularization constant. Defaults to 100.0.
         seed (int): PRNGKey for exponential scaling. Defaults to 0.
 
     Returns:
         A `GradientTransformation` object.
     """
+    random_scaling = scale_by_random(sample_fn=sample_fn, seed=seed)
     return optax.chain(
         online_learner,
-        scale_by_exponential(seed)
+        random_scaling
     )
-    # optax.chain(
-    #     exponentiate_loss(beta, mu),
-    #     online_learner,
-    #     scale_by_random(
-    #         sample_fn=lambda key: jr.exponential(key), seed=seed),
-    # )
 
 
 # Wrapped optimizers from O2NC
