@@ -71,12 +71,13 @@ optimizer:
   #   scale_lr: False 
   #   scale_eps: False
   # Blackbox FTRL
-  online_learner: "blackbox_ftrl"
+  online_learner: "normalized_blackbox"
   ol_config:
     magnitude_learner: "kt"
-    eps: 10
-    beta: 0.999
-    weight_decay: 0.01
+    eps: 100
+    Lipschitz: 50
+    beta: 1.0
+    weight_decay: 0.0
 
 
 benchmark:
@@ -86,7 +87,7 @@ benchmark:
   # if true, uses optax.adamw. should always set to False.
   use_default: False
 
-  lr: 1e-4
+  lr: 3e-4
   lr_schedule: "cosine"
   lr_warmup: 5000
 

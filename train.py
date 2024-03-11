@@ -33,9 +33,12 @@ from loader.c4_loader import get_c4_loader_next_token
 
 import sys
 sys.path.append('./optimizers')
-from optimizers.o2nc import o2nc, eo2nc, adamw, online_nonconvex
+from optimizers.o2nc import o2nc, eo2nc, adamw, online_nonconvex, test_optimizer
 import optimizers.online_learners as ol
 from optimizers.online_learners import unconstrained_ogd, ada_ftrl
+
+
+divider = "="*100
 
 
 class TrainState(NamedTuple):
@@ -167,6 +170,7 @@ def init_optimizer(
     
     if run_benchmark:
         # Run Adamw as the benchmark
+        print("====================== NOTE: RUNNING BENCHMARK ======================")
         benchmark_config = config.benchmark
         if benchmark_config.use_default:
             optimizer = optax.adamw(
@@ -186,24 +190,45 @@ def init_optimizer(
             )
     else:
         # Run online-to-nonconvex conversion.
+        print("====================== NOTE: NORMAL O2NC ======================")
         optim_config = config.optimizer
         ol_config = config.optimizer.ol_config
         if optim_config.online_learner == "unconstrained_ogd":
+            print(">>>Online learner: unconstrained_ogd")
             online_learner = unconstrained_ogd(
                 learning_rate=learning_rate,
                 **ol_config
             )
         elif optim_config.online_learner == "ada_ftrl":
+            print(">>>Online learner: Ada-FTRL")
             online_learner = ada_ftrl(
                 learning_rate=learning_rate,
                 **ol_config
             )
         elif optim_config.online_learner == "blackbox_ftrl":
+            print(">>>Online learner: Blackbox FTRL")
             online_learner = ol.blackbox_reduction(
                 magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
                 direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
                 weight_decay=ol_config.weight_decay,
             )
+        elif optim_config.online_learner == "normalized_blackbox":
+            print(">>>Online learner: Normalized Blackbox")
+            online_learner = ol.normalized_blackbox(
+                base_learner=ol.kt_bettor(eps=ol_config.eps, G=ol_config.Lipschitz),
+                beta=ol_config.beta,
+                weight_decay=ol_config.weight_decay,
+            )
+        else:
+            print(">>>Online learner: Vanilla OGD")
+            online_learner = ol.ogd(
+                learning_rate=learning_rate,
+                weight_decay=ol_config.weight_decay
+            )
+
+        # print(divider+"\ntesting online learner.......")
+        # ol.test_online_learner(online_learner)
+        # print("\ntest finished.\n"+divider)
 
         # Random scaling function.
         exponential_scaling = lambda key: jr.exponential(key)
@@ -213,16 +238,29 @@ def init_optimizer(
             random_scaling = exponential_scaling
         elif optim_config.random_scaling == "uniform":
             random_scaling = uniform_scaling
+        else:
+            random_scaling = exponential_scaling
 
         # Wrap base online learner with (Exponentiated) O2NC.
-        if optim_config.wrap_o2nc == "o2nc":
-            optimizer = online_nonconvex(
-                online_learner=online_learner,
-                random_scaling=random_scaling,
-                seed=optim_config.seed,
-            )
-        elif config.wrap_o2nc == "eo2nc":
-            optimizer = eo2nc(online_learner, config.seed)
+        optimizer = online_nonconvex(
+            online_learner=online_learner,
+            random_scaling=random_scaling,
+            seed=optim_config.seed,
+        )
+        
+        # NOTE: for now, we always wrap with the above more specific wrapper.
+        # if optim_config.wrap_o2nc == "o2nc":
+        #     optimizer = online_nonconvex(
+        #         online_learner=online_learner,
+        #         random_scaling=random_scaling,
+        #         seed=optim_config.optimizer.seed,
+        #     )
+        # elif config.wrap_o2nc == "eo2nc":
+        #     optimizer = eo2nc(online_learner, config.seed)
+
+        # print(divider+"\ntesting wrapped o2nc......")
+        # test_optimizer(optimizer)
+        # print("finish testing.\n"+divider)
 
     # Gradient clipping and NaN wrapper.
     grad_clip = optax.clip_by_global_norm(gradient_clip_val)
@@ -230,6 +268,10 @@ def init_optimizer(
         grad_clip,
         optax.apply_if_finite(optimizer, 15)
     )
+
+    # print(divider+"\ntesting final optimizer......")
+    # test_optimizer(optimizer)
+    # print("finish testing.\n"+divider)
 
     # Initialize opt_state
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -283,7 +325,7 @@ def train_step(
     log_data = {
         "grads/norm": tree_norm(grads)
     }
-    log_data.update(logstate.list_of_logs(opt_state))
+    log_data.update(*logstate.list_of_logs(opt_state))
 
     return loss, accuracy, log_data, new_train_state
 
@@ -340,7 +382,7 @@ def train_loop(
         total_tokens += tokens
         running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
         pbar.set_description(
-            f"train iter: {it}, tokens: {total_tokens}, loss: {loss}, accuracy: {accuracy}, running_loss: {running_loss/(1.0-beta**(it+1))}, running_accuracy: {running_accuracy/(1.0-beta**(it+1))}"
+            f"train iter: {it}, tokens: {total_tokens}, loss: {loss:.2f}, accuracy: {accuracy:.4f}, running_loss: {running_loss/(1.0-beta**(it+1)):.2f}, running_accuracy: {running_accuracy/(1.0-beta**(it+1)):.4f}"
         )
 
         metrics = {
@@ -438,5 +480,134 @@ def train(config: DictConfig) -> None:
     )
 
 
+@hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")
+def test(config: DictConfig) -> None:
+    # logging.info(OmegaConf.to_yaml(config))
+
+    # Initialize C4 dataloader for gpt2.
+    tokenizer = transformers.GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    train_loader = load_c4_data(config, tokenizer)
+
+    # Initialize model, optimizer, and loss.
+    model = GPT(tokenizer.vocab_size, config.model, key=jr.PRNGKey(42))
+    optimizer, opt_state = init_optimizer(model, config, logger=None)
+
+    params = eqx.filter(model, eqx.is_array)
+    updates = jtu.tree_map(jnp.ones_like, params)
+
+    # print(optimizer)
+    optimizer.update(updates, opt_state, params)
+    # for i in range(3):
+    #     updates, opt_state = optimizer.update(updates, opt_state, params)
+    #     params = optax.apply_updates(params, updates)
+    #     print(f"round{i+1} new params:\n", params)
+
+    # if config.train.use_amp:
+    #     dynamic_scaler_state = DynamicScalerState()
+    # else:
+    #     dynamic_scaler_state = None
+
+    # train_state = TrainState(
+    #     model=model,
+    #     opt_state=opt_state,
+    #     dynamic_scaler_state=dynamic_scaler_state,
+    #     iteration=jnp.array(0),
+    # )
+
+    # key = jr.PRNGKey(0)
+
+    # time_keeper = TimeKeeper()
+
+    # print("="*100)
+    # print("Start training loop...")
+    # pbar = tqdm.tqdm(enumerate(train_loader), total=config.train.max_steps)
+
+    # running_loss, running_accuracy, total_tokens = 0, 0, 0
+    
+    # train_step_jit = eqx.filter_jit(
+    #     jtu.Partial(train_step, config=config.train),
+    # )
+    # Just-in-time compilation of the train_step(..., config=config.train) function.
+    # [jax.jit](https://jax.readthedocs.io/en/latest/jax-101/02-jitting.html)
+    # [eqx.filter_jit](https://docs.kidger.site/equinox/api/transformations/#equinox.filter_jit)
+    # [jtu.Partial](https://jax.readthedocs.io/en/latest/_autosummary/jax.tree_util.Partial.html)
+    
+    # # Initialize Wandb Logger
+    # beta = 1.0 - 1.0 / config.train.running_stats_window
+    # iteration_timing_events = ["iteration", "dataloader", "train_step"]
+    # time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
+
+    # for it, batch in pbar:
+    #     print("TRAINING...")
+    #     if it > 3:
+    #         break
+    #     # Load training batch.
+    #     input_ids = jnp.asarray(batch["input_ids"])
+    #     labels = jnp.asarray(batch["labels"])
+    #     to_use, key = jr.split(key)
+
+    #     # Logging message.
+    #     tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
+    #     samples = labels.shape[0]
+    #     time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
+
+        # # Apply one-step train_step.
+        # loss, accuracy, log_data, train_state = train_step_jit(
+        #     train_state, (input_ids, labels), optimizer, key=key
+        # )
+
+        # # Update logger. (can be ignored for now...)
+        # time_keeper.mark(
+        #     end_events={"train_step": 1},
+        # )
+        # running_loss = beta * running_loss + (1.0 - beta) * loss
+        # total_tokens += tokens
+        # running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
+        # pbar.set_description(
+        #     f"train iter: {it}, tokens: {total_tokens}, loss: {loss}, accuracy: {accuracy}, running_loss: {running_loss/(1.0-beta**(it+1))}, running_accuracy: {running_accuracy/(1.0-beta**(it+1))}"
+        # )
+
+        # metrics = {
+        #     "iterations": train_state.iteration,
+        #     "loss": loss,
+        #     "total_tokens": total_tokens,
+        #     "accuracy": accuracy,
+        # }
+        # metrics.update(log_data)
+
+        # time_keeper.mark(
+        #     start_events=["dataloader", "iteration", "tokens", "samples"],
+        #     end_events={"iteration": 1, "tokens": tokens, "samples": samples},
+        # )
+        # durations = time_keeper.get_durations()
+        # proportions = time_keeper.get_proportions()
+        # metrics.update(
+        #     {
+        #         f"time/secs_per/{k}": durations[k]
+        #         for k in iteration_timing_events
+        #         if k in durations
+        #     }
+        # )
+        # metrics.update(
+        #     {
+        #         f"time/fraction_spent/{k}": proportions[k]
+        #         for k in iteration_timing_events
+        #         if k in proportions
+        #     }
+        # )
+
+        # if "iteration" in durations:
+        #     throughput = {
+        #         "throughput/iteration_per_sec": 1.0 / durations["iteration"],
+        #         "throughput/samples_per_sec": 1.0 / durations["samples"],
+        #         "throughput/tokens_per_sec": 1.0 / durations["tokens"],
+        #     }
+        #     metrics.update(throughput)
+
+
+
 if __name__ == "__main__":
     train()
+    # test()

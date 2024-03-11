@@ -1,3 +1,6 @@
+# Check Python library versions.
+divider = "="*100
+print(divider+"\nchecking libraries...")
 import importlib
 
 # List of library names to check versions for
@@ -26,3 +29,23 @@ for lib in libraries:
         # print(f"{lib}: Not installed")
     except AttributeError:
         print(f"{lib}: Version not accessible via __version__")
+
+import torch
+
+
+# Check if CUDA is available.
+print(divider+"\nchecking cuda state...")
+print("CUDA Available:", torch.cuda.is_available())
+
+# List all available GPUs
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        print("GPU:", torch.cuda.get_device_name(i))
+else:
+    print("No GPUs found")
+
+
+# Check JAX device usage.
+print(divider+"\nchecking jax devices...")
+import jax
+print("Devices:", jax.devices())

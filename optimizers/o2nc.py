@@ -14,6 +14,7 @@ sys.path.append('../jaxoptimizers')
 from util import tree_add, tree_subtract, tree_scalar_multiply, tree_norm
 from logger import RateLimitedWandbLog
 import logstate
+import online_learners as ol
 
 
 SampleFunction = Callable[[chex.Array], chex.Numeric]
@@ -247,6 +248,7 @@ def online_nonconvex(
     
     def init_fn(params):
         # NOTE: For now, I assume online learner parameters are always initialized to zeros.
+        # ol_params = jtu.tree_map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), params)
         ol_params = jtu.tree_map(jnp.zeros_like, params)
         ol_state = online_learner.init(ol_params)
         key = jr.PRNGKey(seed)
@@ -278,11 +280,11 @@ def online_nonconvex(
             ol_params=ol_params,
             ol_state=ol_state,
             key=new_key,
-            logging={
+            logging=logstate.Log({
                 "update/random_scaling": scaling,
                 "update/norm_pre_scaling": norm_pre_scaling,
                 "update/norm_post_scaling": norm_post_scaling,
-            }
+            })
         )
     
     return GradientTransformation(init_fn, update_fn)
@@ -396,12 +398,45 @@ def test_optimizer(
     print("initial params:\n", params)
     
     opt_state = optimizer.init(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    print("new params:\n", params)
+    # print(">>>optimizer initialized")
+    
+    for i in range(3):
+        # print(">>>updating optimizer")
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        print(f"round{i+1} new params:\n", params)
     
 
 if __name__ == "__main__":
     # optimizer = eo2nc_unconstrained_ogd(learning_rate=0.01)
-    optimizer = adamw()
+    # optimizer = adamw()
+        
+    # online_learner = ol.ogd(learning_rate=0.01)
+
+    # online_learner = ol.blackbox_reduction(
+    #     magnitude_learner=ol.kt_bettor(eps=10),
+    #     direction_learner=ol.blackbox_ftrl(beta=1.0),
+    #     weight_decay=0.01,
+    # )
+
+    online_learner = ol.normalized_blackbox(
+        base_learner=ol.kt_bettor(eps=100),
+        beta=0.99,
+        weight_decay=0.01,
+    )
+
+    optimizer = online_nonconvex(
+        online_learner=online_learner,
+        random_scaling=lambda key: jr.exponential(key),
+        seed=0,
+    )
+    
+    grad_clip = optax.clip_by_global_norm(10.0)
+    optimizer = optax.chain(
+        grad_clip,
+        optax.apply_if_finite(optimizer, 15)
+        # optimizer
+    )
+    # The issue occurs in optax.apply_if_finite()
+
     test_optimizer(optimizer)

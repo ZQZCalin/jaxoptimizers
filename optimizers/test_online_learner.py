@@ -1,0 +1,130 @@
+import jax
+from jax import numpy as jnp
+from jax import random as jr
+from jax import tree_util as jtu
+from optax import Updates, Params, OptState, ScalarOrSchedule, GradientTransformation
+from typing import Any, Tuple, NamedTuple, Optional, Union, Callable, Protocol
+from tqdm import tqdm
+import sys
+sys.path.append('../jaxoptimizers')
+import util
+import online_learners as ol
+import wandb
+
+
+def train_step(learner, loss_fn, params, opt_state):
+    grads = jax.grad(loss_fn)(params)
+    params, opt_state = learner.update(grads, opt_state, params)
+    return params, opt_state
+
+
+def train(learner, loss_fn, params, num_steps):
+    opt_state = learner.init(params)
+    pbar = tqdm(range(num_steps), total=num_steps)
+    for step in pbar:
+        params, opt_state = train_step(learner, loss_fn, params, opt_state)
+        loss = loss_fn(params)
+        pbar.set_description(f"Step {step}, Params: {params}, Loss: {loss:.2f}")
+        wandb.log({
+            "params/norm": util.tree_norm(params),
+            "loss": loss,
+        })
+
+
+def simple_train(learner, loss_fn, params, num_steps):
+    opt_state = learner.init(params)
+    for i in range(num_steps):
+        params, opt_state = train_step(learner, loss_fn, params, opt_state)
+        print(f"Step {i+1}; Params: {params}; Loss: {loss_fn(params):.2f}")
+
+
+def test_kt_bettor(eps, G, train_full=True):
+    """Test KT bettor on a 1d function f(x) = |x-100|."""
+    # eps = 10
+    # G = 1
+    learner = ol.kt_bettor(eps=eps, G=G)
+    print(f">>>Testing kt bettor with eps={eps} G={G} on f(x) = |x-100|...")
+
+    # Define the loss function
+    def loss_fn(x):
+        return jnp.abs(x - 100)
+
+    if train_full:
+        train(learner, loss_fn, params=jnp.array(0.0), num_steps=1000)
+    else:
+        simple_train(learner, loss_fn, params=jnp.array(0.0), num_steps=20)
+
+
+def test_kt_bettor_large_G(eps, G, train_full=True):
+    """Test KT bettor on a 1d function f(x) = |x-100|^2."""
+    # eps = 10
+    # G = 100
+    learner = ol.kt_bettor(eps=eps, G=G)
+    print(f">>>Testing kt bettor with eps={eps} G={G} on f(x) = |x-100|^2...")
+
+    # Define the loss function
+    def loss_fn(x):
+        return (x - 100)**2
+
+    if train_full:
+        train(learner, loss_fn, params=jnp.array(0.0), num_steps=1000)
+    else:
+        simple_train(learner, loss_fn, params=jnp.array(0.0), num_steps=20)
+
+
+def test_normalized_blackbox():
+    print(">>>Testing normalized blackbox reduction on loss f(x) = \|x-100e\|")
+    learner = ol.normalized_blackbox(
+        base_learner=ol.kt_bettor(eps=10, G=1),
+        beta=1.0,
+        weight_decay=0.0,
+        seed=0,
+    )
+    d = 3
+    x_min = 100*jnp.ones(shape=d)
+
+    def loss_fn(x):
+        return jnp.sqrt(jnp.sum((x-x_min) * (x-x_min)))
+
+    init_params = jnp.ones(shape=d)
+    num_steps = 1000
+
+    train(learner, loss_fn, init_params, num_steps)
+    # params = init_params
+    # opt_state = learner.init(params)
+    # for i in range(20):
+    #     params, opt_state = train_step(learner, loss_fn, params, opt_state)
+    #     print(f"Step {i+1}; Params: {params}; Loss: {loss_fn(params)}")
+
+
+def test_normalized_blackbox_large_G(eps, G):
+    d = 3
+    D = 100
+    x_min = D*jnp.ones(shape=d)
+    learner = ol.normalized_blackbox(
+        base_learner=ol.kt_bettor(eps=eps, G=G),
+        beta=1.0,
+        weight_decay=0.0,
+        seed=0,
+    )
+    print(f">>>Testing normalized blackbox reduction (eps={eps}, G={G:.2f}) on loss f(x) = \|x-e\|^2")
+
+    def loss_fn(x):
+        return jnp.sum((x-x_min) * (x-x_min))
+
+    init_params = jnp.ones(shape=d)
+    num_steps = 1000
+
+    train(learner, loss_fn, init_params, num_steps)
+
+
+if __name__ == "__main__":
+    config = {
+        "eps": 10,
+        "G": 200,
+    }
+    wandb.init(project="KT_Lipschitz", config=config)
+    # test_kt_bettor(**config, train_full=True)
+    # test_kt_bettor_large_G()
+    # test_normalized_blackbox()
+    test_normalized_blackbox_large_G(**config)

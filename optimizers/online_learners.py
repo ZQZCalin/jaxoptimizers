@@ -170,29 +170,57 @@ def wrap_online_learner(
 # Below implements popular online learners.
 # =================================================================================================
 
+
+def current_lr(
+    learning_rate: ScalarOrSchedule,
+    count: chex.Array,
+):
+    """Returns the current learning rate."""    
+    if callable(learning_rate):
+        return learning_rate(count)
+    else:
+        return learning_rate
+
+
 # TODO: modify OGD accordingly
+class OGDState(NamedTuple):
+    """ogd state."""
+    count: chex.Array
+
+
 def ogd(
     learning_rate: optax.ScalarOrSchedule,
-    projection_norm: Optional[float] = None,
-    exponentiated_gradient: bool = False,
-) -> GradientTransformation:
+    # beta: float = 1.0,
+    weight_decay: float = 0.0,
+) -> OnlineLearner:
     """Online Gradient Descent (OGD).
 
-    Updates w_{t+1} <- w_t + eta_t * g_t.
+    Updates w_{t+1} <- w_t + eta_t * g_t. 
+    For now, we assume the learning always cancels the exponentiated gradient.
+    Therefore, beta is always 1.0 effectively.
 
     Args:
-        learning_rate (optax.ScalarOrSchedule): OGD learning rate.
-        projection_norm (Optional[float], optional): _description_. Defaults to None.
-        exponentiated_gradient (bool, optional): _description_. Defaults to False.
-
-    Returns:
-        A `GradientTransformation` object.
+        learning_rate: OGD learning rate.
+        beta: Exponentiated gradient constant. Defaults to 1.0 (no exponentiation).
+        weight_decay: l2 regularization constant. Defaults to 0.0 (no regularization).
     """
-    return scale_by_online_learner(
-        ol_optimizer=optax.sgd(learning_rate),
-        projection_norm=projection_norm,
-        exponentiated_gradient=exponentiated_gradient
-    )
+
+    def init_fn(params=None):
+        del params
+        return OGDState(count=jnp.zeros([], jnp.int32))
+    
+    def update_fn(updates, state, params):
+        # l2 regularization / weight decay
+        grads = jtu.tree_map(
+            lambda g, w: g + weight_decay*w, updates, params)
+        # gradient descent
+        count_inc = optax.safe_int32_increment(state.count)
+        eta = current_lr(learning_rate, state.count)
+        new_params = jtu.tree_map(
+            lambda w, g: w - eta*g, params, grads)
+        return new_params, OGDState(count=count_inc)
+    
+    return OnlineLearner(init_fn, update_fn)
 
 
 class UnconstrainedOGDState(NamedTuple):
@@ -335,6 +363,7 @@ class KTBettorState(NamedTuple):
 # TODO: support Pytree argument for eps
 def kt_bettor(
     eps: float = 1e2,
+    G: float = 1.0,
 ) -> OnlineLearner:
     """KT Coin Bettor.
 
@@ -346,6 +375,7 @@ def kt_bettor(
 
     Args:
         eps (float or Pytree): Initial wealth between 1 and sqrt(T). Defaults to 100.
+        G: Estimated Lipschitz constant.
 
     Returns:
         A `GradientTransformation` object.
@@ -361,6 +391,8 @@ def kt_bettor(
         )
     
     def update_fn(updates, state, params):
+        # NOTE: gradient is scaled down by Lipschitz constant.
+        updates = tree_scalar_multiply(updates, 1/G)
         count_inc = optax.safe_int32_increment(state.count)
         sum_grad = tree_add(state.sum_grad, updates)
         wealth = tree_subtract(state.wealth, tree_multiply(updates, params))
@@ -405,6 +437,7 @@ def blackbox_ftrl(
     return OnlineLearner(init_fn, update_fn)
 
 
+# TODO: add sign(s1:t) for output.
 class BlackboxReductionState(NamedTuple):
     """Black box reduction state."""
     magnitude_params: Params
@@ -472,6 +505,79 @@ def blackbox_reduction(
     return OnlineLearner(init_fn, update_fn)
 
 
+class NormalizedBlackboxState(NamedTuple):
+    """normalized 1d to dimension-free reduction state."""
+    sum_st: Updates
+    sum_gt: Updates
+    base_params: Params
+    base_state: OptState
+    key: jax.Array
+
+
+def normalized_blackbox(
+    base_learner: OnlineLearner,
+    beta: float = 1.0,
+    weight_decay: float = 0.0,
+    seed: int = 0,
+) -> OnlineLearner:
+    """One-dimension to dimension-free reduction.
+
+    Args:
+        base_learner: 1d learner.
+        bet: Exponentiated gradient constant. Defaults to 1.0.
+        weight_decay: l2 regularization constant. Defaults to 0.0.
+        seed: PRNGKey seed. Defaults to 0.
+    """
+
+    def init_fn(params):
+        # For now, always initialize the 1d learner with zt=0.
+        zero = jnp.zeros([], jnp.float32)
+        base_state = base_learner.init(zero)
+        return NormalizedBlackboxState(
+            sum_st=zero,
+            sum_gt=jtu.tree_map(jnp.zeros_like, params),
+            base_params=zero,
+            base_state=base_state,
+            key=jr.PRNGKey(seed),
+        )
+    
+    def update_fn(updates, state, params):
+        gt = jtu.tree_map(
+            lambda g, w: g + weight_decay*w, updates, params)
+        def true_fun(_):
+            key, v = util.random_unit_vector(state.key, gt)
+            # jax.debug.print("  (debug) random vector v = {v}", v=v)
+            st = util.tree_inner_product(gt, v)
+            return key, st
+        def false_fun(_):
+            st = jnp.sign(state.sum_st) * util.tree_inner_product(gt, tree_normalize(state.sum_gt))
+            return state.key, st
+        key, st = jax.lax.cond(
+            util.is_zero_tree(state.sum_gt), true_fun, false_fun, operand=None)
+        # jax.debug.print(">>>gt = {g}, normalized gt = {x}", g=gt, x=tree_normalize(state.sum_gt))
+        # jax.debug.print(">>>inner = {x}", x=util.tree_inner_product(gt, tree_normalize(state.sum_gt)))
+        # jax.debug.print("  (debug) gt = {g}, st = {st}", g=gt, st=st)
+        zt, base_state = base_learner.update(st, state.base_state, state.base_params)
+        sum_st = tree_add(state.sum_st, st)
+        if beta == 1.0:
+            sum_gt = tree_add(state.sum_gt, gt)
+        else:
+            # Since we only use normalized sum_gt, it's ok to use the biased aggregation.
+            sum_gt = jtu.tree_map(
+                lambda m, g: beta*m + (1-beta)*g, state.sum_gt, gt)
+        # jax.debug.print(">>>sum_gt = {s}", s=sum_gt)
+        xt = tree_scalar_multiply(tree_normalize(sum_gt), zt*jnp.sign(sum_st))
+        return xt, NormalizedBlackboxState(
+            sum_st=sum_st,
+            sum_gt=sum_gt,
+            base_params=zt,
+            base_state=base_state,
+            key=key
+        )
+    
+    return OnlineLearner(init_fn, update_fn)
+
+
 # =============== TESTING ===============
 def test_online_learner(
     online_learner: OnlineLearner
@@ -486,10 +592,12 @@ def test_online_learner(
     print("initial params:\n", params)
     
     opt_state = online_learner.init(params)
-    params, opt_state = online_learner.update(grads, opt_state, params)
-    print("new params:\n", params)
-    params, opt_state = online_learner.update(grads, opt_state, params)
-    print("new params:\n", params)
+
+    for i in range(3):
+        # print(">>>updating optimizer")
+        updates, opt_state = online_learner.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        print(f"round{i+1} new params:\n", params)
 
 
 if __name__ == "__main__":
@@ -501,4 +609,31 @@ if __name__ == "__main__":
     # test_online_learner(wrap_online_learner(magnitude))
     # test_online_learner(direction)
     # test_online_learner(wrap_online_learner(direction))
-    test_online_learner(blackbox)
+    # test_online_learner(blackbox)
+    # test_online_learner(normalized_blackbox(
+    #     base_learner=magnitude, beta=1.0, weight_decay=0.0
+    # ))
+
+    ol = normalized_blackbox(
+        base_learner=magnitude, beta=1.0, weight_decay=0.0
+    )
+    tree = {
+        'a': [jnp.array(1.), jnp.array(2.)],  # List of arrays
+        'b': (jnp.array(3.), jnp.array(4.)),  # Tuple of arrays
+        'c': {'d': jnp.array(5.)}  # Nested dictionary with an array
+    }
+    # state = ol.init(tree)
+    # params, new_state = ol.update(tree, state, tree)
+    # print(">>>init_state:")
+    # print(state)
+    # print(">>>update_state")
+    # print(new_state)
+
+    import time
+
+    t = time.time()
+    print(util.is_zero_tree(tree))
+    print(time.time() - t)
+    t = time.time()
+    print(tree_norm(tree) == 0)
+    print(time.time() - t)
