@@ -39,6 +39,7 @@ from jax import tree_util as jtu
 from jax import numpy as jnp
 import equinox as eqx
 
+
 class Log(eqx.Module):
     data: PyTree
     def __init__(self, data):

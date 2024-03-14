@@ -119,6 +119,17 @@ def check_tree_structures_match(tree1, tree2):
     assert is_match, err_msg
 
 
+# ===============================================
+# Other util functions
+# ===============================================
+
+def merge_dicts(*to_merge):
+    result = {}
+    for d in to_merge:
+        result.update(d)
+    return result
+
+
 def get_accuracy(logits: Array, batch: Tuple[Array], ignore_index: int = -100):
     input, target = batch # [N, L],  [N, L]
     predictions = jnp.argmax(logits, axis=2) # [N, L, C] -> [N, L]

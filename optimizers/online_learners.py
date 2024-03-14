@@ -18,6 +18,7 @@ sys.path.append('../jaxoptimizers')
 import util
 from util import tree_add, tree_subtract, tree_multiply, tree_scalar_multiply, tree_dot, tree_norm, tree_normalize, check_tree_structures_match
 from logger import RateLimitedWandbLog
+import logstate
 
 
 class OnlineLearnerInitFn(Protocol):
@@ -358,12 +359,14 @@ class KTBettorState(NamedTuple):
     sum_grad: Updates
     wealth: Updates
     count: chex.Array
+    logging: Optional[logstate.Log]
 
 
 # TODO: support Pytree argument for eps
 def kt_bettor(
     eps: float = 1e2,
     G: float = 1.0,
+    log_reward: bool = False,
 ) -> OnlineLearner:
     """KT Coin Bettor.
 
@@ -376,6 +379,7 @@ def kt_bettor(
     Args:
         eps (float or Pytree): Initial wealth between 1 and sqrt(T). Defaults to 100.
         G: Estimated Lipschitz constant.
+        log_reward: If true, log cumulative reward to wandb. Defaults to False.
 
     Returns:
         A `GradientTransformation` object.
@@ -384,10 +388,18 @@ def kt_bettor(
     def init_fn(params):
         sum_grad = jtu.tree_map(jnp.zeros_like, params)
         wealth = jtu.tree_map(lambda p: jnp.full_like(p, eps), params)
+        if log_reward:
+            logging = logstate.Log({
+                "KT/params": params,
+                "KT/reward": wealth,
+            })
+        else:
+            logging = None
         return KTBettorState(
             sum_grad=sum_grad,
             wealth=wealth,
-            count=jnp.ones([], jnp.int32)
+            count=jnp.ones([], jnp.int32),
+            logging=logging
         )
     
     def update_fn(updates, state, params):
@@ -398,8 +410,15 @@ def kt_bettor(
         wealth = tree_subtract(state.wealth, tree_multiply(updates, params))
         new_params = jtu.tree_map(
             lambda St, Wt: - St / count_inc * Wt, sum_grad, wealth)
+        if log_reward:
+            logging = logstate.Log({
+                "KT/params": new_params,
+                "KT/reward": wealth
+            })
+        else:
+            logging = None
         return new_params, KTBettorState(
-            sum_grad=sum_grad, wealth=wealth, count=count_inc)
+            sum_grad=sum_grad, wealth=wealth, count=count_inc, logging=logging)
     
     return OnlineLearner(init_fn, update_fn)
 

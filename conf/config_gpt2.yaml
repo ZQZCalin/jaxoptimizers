@@ -74,8 +74,8 @@ optimizer:
   online_learner: "normalized_blackbox"
   ol_config:
     magnitude_learner: "kt"
-    eps: 100
-    Lipschitz: 50
+    eps: 5
+    Lipschitz: 20
     beta: 1.0
     weight_decay: 0.0
 

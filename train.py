@@ -25,6 +25,7 @@ import wandb
 import hydra
 from omegaconf import OmegaConf, DictConfig
 
+import util
 from util import softmax_cross_entropy, tree_norm, get_accuracy, get_dtype
 import logstate
 from logger import TimeKeeper, RateLimitedWandbLog
@@ -215,7 +216,11 @@ def init_optimizer(
         elif optim_config.online_learner == "normalized_blackbox":
             print(">>>Online learner: Normalized Blackbox")
             online_learner = ol.normalized_blackbox(
-                base_learner=ol.kt_bettor(eps=ol_config.eps, G=ol_config.Lipschitz),
+                base_learner=ol.kt_bettor(
+                    eps=ol_config.eps, 
+                    G=ol_config.Lipschitz,
+                    log_reward=True,
+                ),
                 beta=ol_config.beta,
                 weight_decay=ol_config.weight_decay,
             )
@@ -323,9 +328,9 @@ def train_step(
 
     # TODO: log effective learning rate and lr * grad
     log_data = {
-        "grads/norm": tree_norm(grads)
+        "grads/norm": tree_norm(grads),
     }
-    log_data.update(*logstate.list_of_logs(opt_state))
+    log_data.update(util.merge_dicts(*logstate.list_of_logs(opt_state)))
 
     return loss, accuracy, log_data, new_train_state
 
