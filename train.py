@@ -42,11 +42,19 @@ from optimizers.online_learners import unconstrained_ogd, ada_ftrl
 divider = "="*100
 
 
+class ExtraTrainState(NamedTuple):
+    scaled_delta: optax.Updates     # x_n - x_{n-1} = s_n * Delta_n
+    rand_scale: Array               # s_n
+    sum_inner_prod: Array           # sum of <grad_i, Delta_i>
+    sum_loss_diff: Array            # sum of f(x_i, z_i) - f(x_{i-1}, z_i)
+
+
 class TrainState(NamedTuple):
     model: eqx.Module
-    opt_state: Any
+    opt_state: optax.OptState
     dynamic_scaler_state: Optional[DynamicScalerState]
     iteration: Array
+    extra_state: Optional[ExtraTrainState]
 
 
 def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
@@ -81,8 +89,7 @@ def loss_fn(model: eqx.Module, batch: Tuple[Array, Array], key: Array):
         key: PRNGKeyArray
 
     Returns:
-        _type_: _description_
-        _type_: _description_
+        Loss value and logits (model outputs).
     """
     def single_example_loss_fn(input, target):
         logits = model(input, key=key)
@@ -311,26 +318,63 @@ def train_step(
         )
     else:
         (loss, logits), grads = value_and_grad_fn(model, batch, key)
+
+    # NOTE: it seems that all JAX updates are "immutable", so it's ok to just make a shallow copy as follows.
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
     )
-    model = eqx.apply_updates(model, updates)
+    new_model = eqx.apply_updates(model, updates)
 
-    new_train_state = TrainState(
-        model=model,
-        opt_state=opt_state,
-        dynamic_scaler_state=dynamic_scaler_state,
-        iteration=train_state.iteration + 1,
-    )
-
-    # Log training info.
+    # Compute train accuracy.
     accuracy = get_accuracy(logits, batch)
 
-    # TODO: log effective learning rate and lr * grad
+    # Log basic statistics.
     log_data = {
         "grads/norm": tree_norm(grads),
     }
-    log_data.update(util.merge_dicts(*logstate.list_of_logs(opt_state)))
+    extra_logs = util.merge_dicts(*logstate.list_of_logs(opt_state))
+    log_data.update(extra_logs)
+
+    # Compute additional log statistics.
+    if config.log_extra:
+        extra_state = train_state.extra_state
+
+        # Compute inner product <grad_t, Delta_t>
+        last_delta = util.tree_scalar_multiply(extra_state.scaled_delta, 1/extra_state.rand_scale)
+        inner_prod = util.tree_inner_product(grads, last_delta)
+        sum_inner_prod = extra_state.sum_inner_prod + inner_prod
+
+        # Compute loss gap F(x_t) - F(x_{t-1})
+        last_model = eqx.apply_updates(model, util.negative_tree(extra_state.scaled_delta))
+        last_loss, _ = loss_fn(last_model, batch, key)
+        loss_diff = loss - last_loss
+        sum_loss_diff = extra_state.sum_loss_diff + loss_diff
+
+        # Update extra_state and log_data
+        new_extra_state = ExtraTrainState(
+            scaled_delta = updates,
+            rand_scale=extra_logs['update/random_scaling'],
+            sum_inner_prod=sum_inner_prod,
+            sum_loss_diff=sum_loss_diff,
+        )
+
+        log_data.update({
+            "update/<grad, Delta>": inner_prod,
+            "update/<grad, Delta>_sum": sum_inner_prod,
+            "update/loss_diff": loss_diff,
+            "update/sum_loss_diff": sum_loss_diff,
+        })
+    else:
+        new_extra_state = None
+
+    # Update new train_state.
+    new_train_state = TrainState(
+        model=new_model,
+        opt_state=opt_state,
+        dynamic_scaler_state=dynamic_scaler_state,
+        iteration=train_state.iteration + 1,
+        extra_state=new_extra_state
+    )
 
     return loss, accuracy, log_data, new_train_state
 
@@ -368,8 +412,6 @@ def train_loop(
         input_ids = jnp.asarray(batch["input_ids"])
         labels = jnp.asarray(batch["labels"])
         to_use, key = jr.split(key)
-
-        # Logging message.
         tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
         samples = labels.shape[0]
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
@@ -378,11 +420,11 @@ def train_loop(
         loss, accuracy, log_data, train_state = train_step_jit(
             train_state, (input_ids, labels), optimizer, key=key
         )
-
-        # Update logger. (can be ignored for now...)
         time_keeper.mark(
             end_events={"train_step": 1},
         )
+
+        # Update loss and accuracy.
         running_loss = beta * running_loss + (1.0 - beta) * loss
         total_tokens += tokens
         running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
@@ -390,6 +432,9 @@ def train_loop(
             f"train iter: {it}, tokens: {total_tokens}, loss: {loss:.2f}, accuracy: {accuracy:.4f}, running_loss: {running_loss/(1.0-beta**(it+1)):.2f}, running_accuracy: {running_accuracy/(1.0-beta**(it+1)):.4f}"
         )
 
+        # ======================================================================
+        # BELOW UPDATES ADDITIONAL LOG MESSAGES...
+        # Basic states.
         metrics = {
             "iterations": train_state.iteration,
             "loss": loss,
@@ -398,6 +443,7 @@ def train_loop(
         }
         metrics.update(log_data)
 
+        # Time complexity related statistics.
         time_keeper.mark(
             start_events=["dataloader", "iteration", "tokens", "samples"],
             end_events={"iteration": 1, "tokens": tokens, "samples": samples},
@@ -463,11 +509,23 @@ def train(config: DictConfig) -> None:
     else:
         dynamic_scaler_state = None
 
+    # Extra train state for logging purpose.
+    if config.train.log_extra:
+        extra_state = ExtraTrainState(
+            scaled_delta=util.zero_tree(eqx.filter(model, eqx.is_array)),
+            rand_scale=jnp.ones([]),
+            sum_inner_prod=jnp.zeros([]),
+            sum_loss_diff=jnp.zeros([]),
+        )
+    else:
+        extra_state = None
+
     train_state = TrainState(
         model=model,
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
         iteration=jnp.array(0),
+        extra_state=extra_state
     )
 
     key = jr.PRNGKey(0)
@@ -504,113 +562,6 @@ def test(config: DictConfig) -> None:
 
     # print(optimizer)
     optimizer.update(updates, opt_state, params)
-    # for i in range(3):
-    #     updates, opt_state = optimizer.update(updates, opt_state, params)
-    #     params = optax.apply_updates(params, updates)
-    #     print(f"round{i+1} new params:\n", params)
-
-    # if config.train.use_amp:
-    #     dynamic_scaler_state = DynamicScalerState()
-    # else:
-    #     dynamic_scaler_state = None
-
-    # train_state = TrainState(
-    #     model=model,
-    #     opt_state=opt_state,
-    #     dynamic_scaler_state=dynamic_scaler_state,
-    #     iteration=jnp.array(0),
-    # )
-
-    # key = jr.PRNGKey(0)
-
-    # time_keeper = TimeKeeper()
-
-    # print("="*100)
-    # print("Start training loop...")
-    # pbar = tqdm.tqdm(enumerate(train_loader), total=config.train.max_steps)
-
-    # running_loss, running_accuracy, total_tokens = 0, 0, 0
-    
-    # train_step_jit = eqx.filter_jit(
-    #     jtu.Partial(train_step, config=config.train),
-    # )
-    # Just-in-time compilation of the train_step(..., config=config.train) function.
-    # [jax.jit](https://jax.readthedocs.io/en/latest/jax-101/02-jitting.html)
-    # [eqx.filter_jit](https://docs.kidger.site/equinox/api/transformations/#equinox.filter_jit)
-    # [jtu.Partial](https://jax.readthedocs.io/en/latest/_autosummary/jax.tree_util.Partial.html)
-    
-    # # Initialize Wandb Logger
-    # beta = 1.0 - 1.0 / config.train.running_stats_window
-    # iteration_timing_events = ["iteration", "dataloader", "train_step"]
-    # time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
-
-    # for it, batch in pbar:
-    #     print("TRAINING...")
-    #     if it > 3:
-    #         break
-    #     # Load training batch.
-    #     input_ids = jnp.asarray(batch["input_ids"])
-    #     labels = jnp.asarray(batch["labels"])
-    #     to_use, key = jr.split(key)
-
-    #     # Logging message.
-    #     tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
-    #     samples = labels.shape[0]
-    #     time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
-
-        # # Apply one-step train_step.
-        # loss, accuracy, log_data, train_state = train_step_jit(
-        #     train_state, (input_ids, labels), optimizer, key=key
-        # )
-
-        # # Update logger. (can be ignored for now...)
-        # time_keeper.mark(
-        #     end_events={"train_step": 1},
-        # )
-        # running_loss = beta * running_loss + (1.0 - beta) * loss
-        # total_tokens += tokens
-        # running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
-        # pbar.set_description(
-        #     f"train iter: {it}, tokens: {total_tokens}, loss: {loss}, accuracy: {accuracy}, running_loss: {running_loss/(1.0-beta**(it+1))}, running_accuracy: {running_accuracy/(1.0-beta**(it+1))}"
-        # )
-
-        # metrics = {
-        #     "iterations": train_state.iteration,
-        #     "loss": loss,
-        #     "total_tokens": total_tokens,
-        #     "accuracy": accuracy,
-        # }
-        # metrics.update(log_data)
-
-        # time_keeper.mark(
-        #     start_events=["dataloader", "iteration", "tokens", "samples"],
-        #     end_events={"iteration": 1, "tokens": tokens, "samples": samples},
-        # )
-        # durations = time_keeper.get_durations()
-        # proportions = time_keeper.get_proportions()
-        # metrics.update(
-        #     {
-        #         f"time/secs_per/{k}": durations[k]
-        #         for k in iteration_timing_events
-        #         if k in durations
-        #     }
-        # )
-        # metrics.update(
-        #     {
-        #         f"time/fraction_spent/{k}": proportions[k]
-        #         for k in iteration_timing_events
-        #         if k in proportions
-        #     }
-        # )
-
-        # if "iteration" in durations:
-        #     throughput = {
-        #         "throughput/iteration_per_sec": 1.0 / durations["iteration"],
-        #         "throughput/samples_per_sec": 1.0 / durations["samples"],
-        #         "throughput/tokens_per_sec": 1.0 / durations["tokens"],
-        #     }
-        #     metrics.update(throughput)
-
 
 
 if __name__ == "__main__":

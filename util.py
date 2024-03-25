@@ -35,6 +35,11 @@ def tree_dot(tree1, tree2):
     )
 
 
+def negative_tree(tree):
+    """A `jtu.tree_map`-broadcasted version of tree -> -tree."""
+    return jtu.tree_map(lambda t: -t, tree)
+
+
 def tree_inner_product(tree1, tree2):
     leaves1, _ = jtu.tree_flatten(tree1)
     leaves2, _ = jtu.tree_flatten(tree2)
