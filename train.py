@@ -34,19 +34,13 @@ from loader.c4_loader import get_c4_loader_next_token
 
 import sys
 sys.path.append('./optimizers')
-from optimizers.o2nc import o2nc, eo2nc, adamw, online_nonconvex, test_optimizer
+from optimizers.o2nc import adamw, online_nonconvex
 import optimizers.online_learners as ol
-from optimizers.online_learners import unconstrained_ogd, ada_ftrl
 
 
 divider = "="*100
 
 
-class ExtraTrainState(NamedTuple):
-    scaled_delta: optax.Updates     # x_n - x_{n-1} = s_n * Delta_n
-    rand_scale: Array               # s_n
-    sum_inner_prod: Array           # sum of <grad_i, Delta_i>
-    sum_loss_diff: Array            # sum of f(x_i, z_i) - f(x_{i-1}, z_i)
 
 
 class TrainState(NamedTuple):
@@ -54,7 +48,18 @@ class TrainState(NamedTuple):
     opt_state: optax.OptState
     dynamic_scaler_state: Optional[DynamicScalerState]
     iteration: Array
-    extra_state: Optional[ExtraTrainState]
+
+
+class ExtraTrainState(NamedTuple):
+    """Additional train states stored for additional loggings."""
+    # High memory costs.
+    params_diff: Optional[optax.Updates]        # x_n - x_{n-1} = s_n * Delta_n
+    last_grads: Optional[optax.Updates]         # grad_{n-1}
+    sum_grads: Optional[optax.Updates]          # sum_{i=1}^{n-1} grad_i
+    # Low memory costs.
+    random_scalar: Optional[Array]              # s_n
+    cumulative_loss_ol: Optional[Array]         # sum_{i=1}^n <grad_i, Delta_i>
+    cumulative_loss_optim: Optional[Array]      # sum_{i=1}^n f(x_i, z_i) - f(x_{i-1}, z_i)
 
 
 def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
@@ -201,27 +206,25 @@ def init_optimizer(
         print("====================== NOTE: NORMAL O2NC ======================")
         optim_config = config.optimizer
         ol_config = config.optimizer.ol_config
-        if optim_config.online_learner == "unconstrained_ogd":
-            print(">>>Online learner: unconstrained_ogd")
-            online_learner = unconstrained_ogd(
+        print(f">>> Online learner: {optim_config.online_learner}")
+        if optim_config.online_learner == "ogd_mirror_descent":
+            online_learner = ol.ogd_mirror_descent(
                 learning_rate=learning_rate,
-                **ol_config
+                beta=ol_config.beta,
+                mu=ol_config.mu,
             )
         elif optim_config.online_learner == "ada_ftrl":
-            print(">>>Online learner: Ada-FTRL")
-            online_learner = ada_ftrl(
+            online_learner = ol.ada_ftrl(
                 learning_rate=learning_rate,
                 **ol_config
             )
         elif optim_config.online_learner == "blackbox_ftrl":
-            print(">>>Online learner: Blackbox FTRL")
             online_learner = ol.blackbox_reduction(
                 magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
                 direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
                 weight_decay=ol_config.weight_decay,
             )
         elif optim_config.online_learner == "normalized_blackbox":
-            print(">>>Online learner: Normalized Blackbox")
             online_learner = ol.normalized_blackbox(
                 base_learner=ol.kt_bettor(
                     eps=ol_config.eps, 
@@ -230,9 +233,9 @@ def init_optimizer(
                 ),
                 beta=ol_config.beta,
                 weight_decay=ol_config.weight_decay,
+                per_layer=ol_config.per_layer,
             )
         else:
-            print(">>>Online learner: Vanilla OGD")
             online_learner = ol.ogd(
                 learning_rate=learning_rate,
                 weight_decay=ol_config.weight_decay
@@ -293,6 +296,7 @@ def init_optimizer(
 
 def train_step(
     train_state: TrainState,
+    extra_train_state: Optional[ExtraTrainState],
     batch: Tuple[Array, Array],
     optimizer: optax.GradientTransformation,
     key: Array,
@@ -331,56 +335,72 @@ def train_step(
     # Log basic statistics.
     log_data = {
         "grads/norm": tree_norm(grads),
+        "grads/l1-norm": util.tree_l1_norm(grads),
     }
     extra_logs = util.merge_dicts(*logstate.list_of_logs(opt_state))
     log_data.update(extra_logs)
-
-    # Compute additional log statistics.
-    if config.log_extra:
-        extra_state = train_state.extra_state
-
-        # Compute inner product <grad_t, Delta_t>
-        last_delta = util.tree_scalar_multiply(extra_state.scaled_delta, 1/extra_state.rand_scale)
-        inner_prod = util.tree_inner_product(grads, last_delta)
-        sum_inner_prod = extra_state.sum_inner_prod + inner_prod
-
-        # Compute loss gap F(x_t) - F(x_{t-1})
-        last_model = eqx.apply_updates(model, util.negative_tree(extra_state.scaled_delta))
-        last_loss, _ = loss_fn(last_model, batch, key)
-        loss_diff = loss - last_loss
-        sum_loss_diff = extra_state.sum_loss_diff + loss_diff
-
-        # Update extra_state and log_data
-        new_extra_state = ExtraTrainState(
-            scaled_delta = updates,
-            rand_scale=extra_logs['update/random_scaling'],
-            sum_inner_prod=sum_inner_prod,
-            sum_loss_diff=sum_loss_diff,
-        )
-
-        log_data.update({
-            "update/<grad, Delta>": inner_prod,
-            "update/<grad, Delta>_sum": sum_inner_prod,
-            "update/loss_diff": loss_diff,
-            "update/sum_loss_diff": sum_loss_diff,
-        })
-    else:
-        new_extra_state = None
 
     # Update new train_state.
     new_train_state = TrainState(
         model=new_model,
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
-        iteration=train_state.iteration + 1,
-        extra_state=new_extra_state
+        iteration=train_state.iteration + 1
     )
 
-    return loss, accuracy, log_data, new_train_state
+    # Compute additional log statistics.
+    if config.log_extra:
+        # Compute online learner instantaneous loss: <grad_n, Delta_n>
+        last_delta = util.tree_scalar_multiply(
+            extra_train_state.params_diff, 1/extra_train_state.random_scalar)
+        loss_ol = util.tree_inner_product(grads, last_delta)
+        cumulative_loss_ol = extra_train_state.cumulative_loss_ol + loss_ol
+
+        log_data.update({
+            "update/online_learner:instant_loss": loss_ol,
+            "update/online_learner:cumulative_loss": cumulative_loss_ol,
+        })
+
+        # Compute optimization loss gap f(x_n, z_n) - f(x_{n-1}, z_n)
+        last_model = eqx.apply_updates(
+            model, util.negative_tree(extra_train_state.params_diff))
+        last_loss, _ = loss_fn(last_model, batch, key)
+        loss_diff = loss - last_loss
+        cumulative_loss_optim = extra_train_state.cumulative_loss_optim + loss_diff
+
+        log_data.update({
+            "update/optim:loss_diff": loss_diff,
+            "update/optim:cumulative_loss": cumulative_loss_optim,
+        })
+
+        # Gradient measures: <g_n, g_{n-1}> and <g_n, g_{1:n-1}>
+        log_data.update({
+            "grads/<gn, g(n-1)>": util.tree_inner_product(grads, extra_train_state.last_grads),
+            "grads/<gn, g(1:n-1)>": util.tree_inner_product(grads, extra_train_state.sum_grads),
+            "grads/cos(gn, g(n-1))": util.tree_cosine_similarity(grads, extra_train_state.last_grads),
+            "grads/cos(gn, g(1:n-1))": util.tree_cosine_similarity(grads, extra_train_state.sum_grads),
+        })
+
+        # Update extra_train_state.
+        random_scalar = extra_logs['update/random_scaling']
+        sum_grads = util.tree_add(extra_train_state.sum_grads, grads)
+        new_extra_train_state = ExtraTrainState(
+            params_diff=updates,
+            last_grads=grads,
+            sum_grads=sum_grads,
+            random_scalar=random_scalar,
+            cumulative_loss_ol=cumulative_loss_ol,
+            cumulative_loss_optim=cumulative_loss_optim   
+        )
+    else:
+        new_extra_train_state = None
+
+    return loss, accuracy, log_data, new_train_state, new_extra_train_state
 
 
 def train_loop(
     train_state: TrainState,
+    extra_train_state: Optional[ExtraTrainState],
     optimizer: Any,
     dataloader: Any,
     config: DictConfig,
@@ -417,8 +437,8 @@ def train_loop(
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
 
         # Apply one-step train_step.
-        loss, accuracy, log_data, train_state = train_step_jit(
-            train_state, (input_ids, labels), optimizer, key=key
+        loss, accuracy, log_data, train_state, extra_train_state = train_step_jit(
+            train_state, extra_train_state, (input_ids, labels), optimizer, key=key
         )
         time_keeper.mark(
             end_events={"train_step": 1},
@@ -509,23 +529,22 @@ def train(config: DictConfig) -> None:
     else:
         dynamic_scaler_state = None
 
-    # Extra train state for logging purpose.
-    if config.train.log_extra:
-        extra_state = ExtraTrainState(
-            scaled_delta=util.zero_tree(eqx.filter(model, eqx.is_array)),
-            rand_scale=jnp.ones([]),
-            sum_inner_prod=jnp.zeros([]),
-            sum_loss_diff=jnp.zeros([]),
-        )
-    else:
-        extra_state = None
-
     train_state = TrainState(
         model=model,
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
-        iteration=jnp.array(0),
-        extra_state=extra_state
+        iteration=jnp.array(0)
+    )
+
+    # Extra train state for logging purpose.
+    zeros = util.zero_tree(eqx.filter(model, eqx.is_array))
+    extra_train_state = None if not config.train.log_extra else ExtraTrainState(
+        params_diff=zeros,
+        last_grads=zeros,
+        sum_grads=zeros,
+        random_scalar=jnp.ones([]),
+        cumulative_loss_ol=jnp.zeros([]),
+        cumulative_loss_optim=jnp.zeros([]),
     )
 
     key = jr.PRNGKey(0)
@@ -534,6 +553,7 @@ def train(config: DictConfig) -> None:
 
     train_loop(
         train_state,
+        extra_train_state,
         optimizer,
         train_loader,
         config,

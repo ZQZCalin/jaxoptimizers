@@ -63,7 +63,7 @@ optimizer:
   # weight_decay: 0.01
 
   # base online learner. currently supports
-  # ["unconstrained_ogd", "ada_ftrl", "blackbox_ftrl"]
+  # ["ada_ftrl", "normalized_blackbox", "ogd_mirror_descent"]
   # Ada-FTRL
   # online_learner: "ada_ftrl"
   # ol_config:
@@ -74,13 +74,19 @@ optimizer:
   #   scale_lr: False 
   #   scale_eps: False
   # Blackbox FTRL
-  online_learner: "normalized_blackbox"
+  # Commented on 2024/03/28
+  # online_learner: "normalized_blackbox"
+  # ol_config:
+  #   magnitude_learner: "kt"
+  #   eps: 5
+  #   Lipschitz: 20
+  #   beta: 1.0
+  #   weight_decay: 0.0
+  #   per_layer: True
+  online_learner: "ogd_mirror_descent"
   ol_config:
-    magnitude_learner: "kt"
-    eps: 5
-    Lipschitz: 20
     beta: 1.0
-    weight_decay: 0.0
+    mu: 0.0
 
 
 benchmark:

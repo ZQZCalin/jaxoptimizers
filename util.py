@@ -40,22 +40,42 @@ def negative_tree(tree):
     return jtu.tree_map(lambda t: -t, tree)
 
 
+def tree_scalar_multiply(tree, scalar):
+    return jtu.tree_map(lambda x: scalar*x, tree)
+
+
+def tree_l1_norm(tree):
+    """Returns the l1 norm of the vectorized tree."""
+    return jtu.tree_reduce(
+        lambda x, y: x + y,
+        jtu.tree_map(lambda x: jnp.sum(jnp.abs(x)), tree)
+    )
+
+
+def tree_l2_norm(tree):
+    """Returns the l2 norm of the vectorized tree."""
+    return jnp.sqrt(
+        jtu.tree_reduce(
+            lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
+        )
+    )
+
+
+# TODO: deprecated, to be removed
+def tree_norm(tree):
+    """Returns the l2 norm of the vectorized tree."""
+    return tree_l2_norm(tree)
+
+
 def tree_inner_product(tree1, tree2):
     leaves1, _ = jtu.tree_flatten(tree1)
     leaves2, _ = jtu.tree_flatten(tree2)
     return sum(jnp.sum(a * b) for a, b in zip(leaves1, leaves2))
 
 
-def tree_scalar_multiply(tree, scalar):
-    return jtu.tree_map(lambda x: scalar*x, tree)
-
-
-def tree_norm(tree):
-    return jnp.sqrt(
-        jtu.tree_reduce(
-            lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x * x), tree)
-        )
-    )
+def tree_cosine_similarity(tree1, tree2):
+    """Returns the cosine similarity of two trees."""
+    return tree_inner_product(tree1, tree2) / tree_l2_norm(tree2) / tree_l2_norm(tree2)
 
 
 def is_zero_tree(tree):
