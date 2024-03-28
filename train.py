@@ -41,8 +41,6 @@ import optimizers.online_learners as ol
 divider = "="*100
 
 
-
-
 class TrainState(NamedTuple):
     model: eqx.Module
     opt_state: optax.OptState

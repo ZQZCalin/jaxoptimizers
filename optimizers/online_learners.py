@@ -271,7 +271,7 @@ def ogd_mirror_descent(
         eta = get_current_lr(learning_rate, state.count)
         new_params = jtu.tree_map(
             lambda w, g: (w - eta*g) * beta/(1+eta*mu), params, updates)
-        return new_params, OGDState(count=count_inc)
+        return new_params, OGDMirrorDescentState(count=count_inc)
     
     return OnlineLearner(init_fn, update_fn)
 
