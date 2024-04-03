@@ -43,24 +43,19 @@ train:
   dataloader_workers: 2
 
 optimizer:
-  # learning rate scheduler
-  lr: 1e-4
-  lr_schedule: "cosine"
-  lr_warmup: 5000
-
   # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
   wrap_o2nc: "o2nc"
 
   # PRNGKey seed for random scaling
   seed: 0
 
-  # random scaling function. values in ["exponential", ...]
+  # random scaling function. values in ["deterministic", "exponential", ...]
   random_scaling: "exponential"
 
-  # regularization constants 
-  # NOTE: exponentiation should be specified in online learner since each online learner
-  # implements exponentiated gradient in its own way.
-  # weight_decay: 0.01
+  # learning rate scheduler
+  lr: 0.01
+  lr_schedule: "cosine"
+  lr_warmup: 5000
 
   # base online learner. currently supports
   # ["ada_ftrl", "normalized_blackbox", "ogd_mirror_descent"]

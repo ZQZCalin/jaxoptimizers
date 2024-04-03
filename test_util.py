@@ -30,7 +30,17 @@ def test_tree_cosine_similarity():
     print("    actual result:", util.tree_cosine_similarity(tree, util.negative_tree(tree)))
 
 
+def test_is_finite_tree():
+    print(">>> Testing tree_cosine_similarity.")
+    print("    expected result: True")
+    print("    actual result:", util.is_finite_tree(tree))
+    inf_tree = [jnp.array([jnp.nan])]
+    print("    expected result: False")
+    print("    actual result:", util.is_finite_tree(inf_tree))
+
+
 if __name__ == "__main__":
     # test_tree_inner()
     # test_tree_l1_norm()
-    test_tree_cosine_similarity()
+    # test_tree_cosine_similarity()
+    test_is_finite_tree()

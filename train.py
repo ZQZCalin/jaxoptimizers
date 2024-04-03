@@ -58,6 +58,7 @@ class ExtraTrainState(NamedTuple):
     random_scalar: Optional[Array]              # s_n
     cumulative_loss_ol: Optional[Array]         # sum_{i=1}^n <grad_i, Delta_i>
     cumulative_loss_optim: Optional[Array]      # sum_{i=1}^n f(x_i, z_i) - f(x_{i-1}, z_i)
+    num_inf_grads: Optional[Array]              # sum_{i=1}^n one(grad_i = nan)
 
 
 def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
@@ -246,13 +247,17 @@ def init_optimizer(
         # Random scaling function.
         exponential_scaling = lambda key: jr.exponential(key)
         uniform_scaling = lambda key: jr.uniform(key, minval=0, maxval=2)
+        no_scaling = lambda key: jnp.ones([])
 
-        if optim_config.random_scaling == "exponential":
+        if optim_config.random_scaling == "deterministic":
+            random_scaling = no_scaling
+        elif optim_config.random_scaling == "exponential":
             random_scaling = exponential_scaling
         elif optim_config.random_scaling == "uniform":
             random_scaling = uniform_scaling
         else:
-            random_scaling = exponential_scaling
+            print("*** Alert: no randomized scaling is applied!")
+            random_scaling = no_scaling
 
         # Wrap base online learner with (Exponentiated) O2NC.
         optimizer = online_nonconvex(
@@ -346,8 +351,23 @@ def train_step(
         iteration=train_state.iteration + 1
     )
 
+    # TODO: debug current logging methods and add new logs if needed.
     # Compute additional log statistics.
     if config.log_extra:
+        # Handle possible infinite grads.
+        def extra_state_if_nan(_):
+            # Special case handler when grads=nan:
+            # keep params_diff, random_scalar and last_grads from last iteration and treat new grads as zeros.
+            return extra_train_state.params_diff, extra_train_state.last_grads, util.zero_tree(grads), \
+                optax.safe_int32_increment(extra_train_state.num_inf_grads), extra_train_state.random_scalar
+        
+        def extra_state_if_finite(_):
+            # Standard case when grads are finite.
+            return updates, grads, grads, extra_train_state.num_inf_grads, extra_logs['update/random_scaling']
+        
+        new_params_diff, new_last_grads, grads, new_num_inf_grads, new_random_scalar = jax.lax.cond(
+            util.is_finite_tree(grads), extra_state_if_finite, extra_state_if_nan, operand=None)
+
         # Compute online learner instantaneous loss: <grad_n, Delta_n>
         last_delta = util.tree_scalar_multiply(
             extra_train_state.params_diff, 1/extra_train_state.random_scalar)
@@ -377,18 +397,19 @@ def train_step(
             "grads/<gn, g(1:n-1)>": util.tree_inner_product(grads, extra_train_state.sum_grads),
             "grads/cos(gn, g(n-1))": util.tree_cosine_similarity(grads, extra_train_state.last_grads),
             "grads/cos(gn, g(1:n-1))": util.tree_cosine_similarity(grads, extra_train_state.sum_grads),
+            "grads/inf_grads": extra_train_state.num_inf_grads,
         })
 
         # Update extra_train_state.
-        random_scalar = extra_logs['update/random_scaling']
         sum_grads = util.tree_add(extra_train_state.sum_grads, grads)
         new_extra_train_state = ExtraTrainState(
-            params_diff=updates,
-            last_grads=grads,
+            params_diff=new_params_diff,
+            last_grads=new_last_grads,
             sum_grads=sum_grads,
-            random_scalar=random_scalar,
+            random_scalar=new_random_scalar,
             cumulative_loss_ol=cumulative_loss_ol,
-            cumulative_loss_optim=cumulative_loss_optim   
+            cumulative_loss_optim=cumulative_loss_optim,
+            num_inf_grads=new_num_inf_grads,
         )
     else:
         new_extra_train_state = None
@@ -543,6 +564,7 @@ def train(config: DictConfig) -> None:
         random_scalar=jnp.ones([]),
         cumulative_loss_ol=jnp.zeros([]),
         cumulative_loss_optim=jnp.zeros([]),
+        num_inf_grads=jnp.zeros([], jnp.int32),
     )
 
     key = jr.PRNGKey(0)

@@ -67,22 +67,18 @@ def tree_norm(tree):
     return tree_l2_norm(tree)
 
 
-def tree_inner_product(tree1, tree2):
-    leaves1, _ = jtu.tree_flatten(tree1)
-    leaves2, _ = jtu.tree_flatten(tree2)
-    return sum(jnp.sum(a * b) for a, b in zip(leaves1, leaves2))
-
-
-def tree_cosine_similarity(tree1, tree2):
-    """Returns the cosine similarity of two trees."""
-    return tree_inner_product(tree1, tree2) / tree_l2_norm(tree2) / tree_l2_norm(tree2)
-
-
 def is_zero_tree(tree):
     """Checks if a tree only has zero entries."""
     return jtu.tree_reduce(
         lambda x, y: x & y, jtu.tree_map(lambda x: jnp.all(x == 0), tree)
     )
+
+
+def is_finite_tree(tree):
+    """Returns whether a tree is finite."""
+    leaves = jtu.tree_flatten(tree)[0]
+    return jnp.all(
+        jnp.array([jnp.all(jnp.isfinite(node)) for node in leaves]))
 
 
 def tree_normalize(tree):
@@ -93,6 +89,17 @@ def tree_normalize(tree):
         false_fun=lambda _: tree_scalar_multiply(tree, 1/tree_norm(tree)),
         operand=None,
     )
+
+
+def tree_inner_product(tree1, tree2):
+    leaves1, _ = jtu.tree_flatten(tree1)
+    leaves2, _ = jtu.tree_flatten(tree2)
+    return sum(jnp.sum(a * b) for a, b in zip(leaves1, leaves2))
+
+
+def tree_cosine_similarity(tree1, tree2):
+    """Returns the cosine similarity of two trees."""
+    return tree_inner_product(tree_normalize(tree1), tree_normalize(tree2))
 
 
 def tree_norm_direction_decomposition(tree):
