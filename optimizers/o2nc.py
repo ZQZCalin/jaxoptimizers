@@ -70,6 +70,7 @@ def scale_by_exponential(
     return scale_by_random(sample_fn, seed)
 
 
+# TODO: deprecate everything below except for online_nonconvex.
 class ScaleByO2NCState(NamedTuple):
     """scale_by_o2nc state."""
     aux_params: Updates

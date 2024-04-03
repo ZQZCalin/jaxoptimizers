@@ -34,9 +34,8 @@ from loader.c4_loader import get_c4_loader_next_token
 
 import sys
 sys.path.append('./optimizers')
-from optimizers.o2nc import o2nc, eo2nc, adamw, online_nonconvex, test_optimizer
+from optimizers.o2nc import adamw, online_nonconvex
 import optimizers.online_learners as ol
-from optimizers.online_learners import unconstrained_ogd, ada_ftrl
 
 
 divider = "="*100
@@ -44,9 +43,22 @@ divider = "="*100
 
 class TrainState(NamedTuple):
     model: eqx.Module
-    opt_state: Any
+    opt_state: optax.OptState
     dynamic_scaler_state: Optional[DynamicScalerState]
     iteration: Array
+
+
+class ExtraTrainState(NamedTuple):
+    """Additional train states stored for additional loggings."""
+    # High memory costs.
+    params_diff: Optional[optax.Updates]        # x_n - x_{n-1} = s_n * Delta_n
+    last_grads: Optional[optax.Updates]         # grad_{n-1}
+    sum_grads: Optional[optax.Updates]          # sum_{i=1}^{n-1} grad_i
+    # Low memory costs.
+    random_scalar: Optional[Array]              # s_n
+    cumulative_loss_ol: Optional[Array]         # sum_{i=1}^n <grad_i, Delta_i>
+    cumulative_loss_optim: Optional[Array]      # sum_{i=1}^n f(x_i, z_i) - f(x_{i-1}, z_i)
+    num_inf_grads: Optional[Array]              # sum_{i=1}^n one(grad_i = nan)
 
 
 def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
@@ -81,8 +93,7 @@ def loss_fn(model: eqx.Module, batch: Tuple[Array, Array], key: Array):
         key: PRNGKeyArray
 
     Returns:
-        _type_: _description_
-        _type_: _description_
+        Loss value and logits (model outputs).
     """
     def single_example_loss_fn(input, target):
         logits = model(input, key=key)
@@ -194,27 +205,25 @@ def init_optimizer(
         print("====================== NOTE: NORMAL O2NC ======================")
         optim_config = config.optimizer
         ol_config = config.optimizer.ol_config
-        if optim_config.online_learner == "unconstrained_ogd":
-            print(">>>Online learner: unconstrained_ogd")
-            online_learner = unconstrained_ogd(
+        print(f">>> Online learner: {optim_config.online_learner}")
+        if optim_config.online_learner == "ogd_mirror_descent":
+            online_learner = ol.ogd_mirror_descent(
                 learning_rate=learning_rate,
-                **ol_config
+                beta=ol_config.beta,
+                mu=ol_config.mu,
             )
         elif optim_config.online_learner == "ada_ftrl":
-            print(">>>Online learner: Ada-FTRL")
-            online_learner = ada_ftrl(
+            online_learner = ol.ada_ftrl(
                 learning_rate=learning_rate,
                 **ol_config
             )
         elif optim_config.online_learner == "blackbox_ftrl":
-            print(">>>Online learner: Blackbox FTRL")
             online_learner = ol.blackbox_reduction(
                 magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
                 direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
                 weight_decay=ol_config.weight_decay,
             )
         elif optim_config.online_learner == "normalized_blackbox":
-            print(">>>Online learner: Normalized Blackbox")
             online_learner = ol.normalized_blackbox(
                 base_learner=ol.kt_bettor(
                     eps=ol_config.eps, 
@@ -223,9 +232,9 @@ def init_optimizer(
                 ),
                 beta=ol_config.beta,
                 weight_decay=ol_config.weight_decay,
+                per_layer=ol_config.per_layer,
             )
         else:
-            print(">>>Online learner: Vanilla OGD")
             online_learner = ol.ogd(
                 learning_rate=learning_rate,
                 weight_decay=ol_config.weight_decay
@@ -238,13 +247,17 @@ def init_optimizer(
         # Random scaling function.
         exponential_scaling = lambda key: jr.exponential(key)
         uniform_scaling = lambda key: jr.uniform(key, minval=0, maxval=2)
+        no_scaling = lambda key: jnp.ones([])
 
-        if optim_config.random_scaling == "exponential":
+        if optim_config.random_scaling == "deterministic":
+            random_scaling = no_scaling
+        elif optim_config.random_scaling == "exponential":
             random_scaling = exponential_scaling
         elif optim_config.random_scaling == "uniform":
             random_scaling = uniform_scaling
         else:
-            random_scaling = exponential_scaling
+            print("*** Alert: no randomized scaling is applied!")
+            random_scaling = no_scaling
 
         # Wrap base online learner with (Exponentiated) O2NC.
         optimizer = online_nonconvex(
@@ -286,6 +299,7 @@ def init_optimizer(
 
 def train_step(
     train_state: TrainState,
+    extra_train_state: Optional[ExtraTrainState],
     batch: Tuple[Array, Array],
     optimizer: optax.GradientTransformation,
     key: Array,
@@ -311,32 +325,101 @@ def train_step(
         )
     else:
         (loss, logits), grads = value_and_grad_fn(model, batch, key)
+
+    # NOTE: it seems that all JAX updates are "immutable", so it's ok to just make a shallow copy as follows.
     updates, opt_state = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
     )
-    model = eqx.apply_updates(model, updates)
+    new_model = eqx.apply_updates(model, updates)
 
-    new_train_state = TrainState(
-        model=model,
-        opt_state=opt_state,
-        dynamic_scaler_state=dynamic_scaler_state,
-        iteration=train_state.iteration + 1,
-    )
-
-    # Log training info.
+    # Compute train accuracy.
     accuracy = get_accuracy(logits, batch)
 
-    # TODO: log effective learning rate and lr * grad
+    # Log basic statistics.
     log_data = {
         "grads/norm": tree_norm(grads),
+        "grads/l1-norm": util.tree_l1_norm(grads),
     }
-    log_data.update(util.merge_dicts(*logstate.list_of_logs(opt_state)))
+    extra_logs = util.merge_dicts(*logstate.list_of_logs(opt_state))
+    log_data.update(extra_logs)
 
-    return loss, accuracy, log_data, new_train_state
+    # Update new train_state.
+    new_train_state = TrainState(
+        model=new_model,
+        opt_state=opt_state,
+        dynamic_scaler_state=dynamic_scaler_state,
+        iteration=train_state.iteration + 1
+    )
+
+    # TODO: debug current logging methods and add new logs if needed.
+    # Compute additional log statistics.
+    if config.log_extra:
+        # Handle possible infinite grads.
+        def extra_state_if_nan(_):
+            # Special case handler when grads=nan:
+            # keep params_diff, random_scalar and last_grads from last iteration and treat new grads as zeros.
+            return extra_train_state.params_diff, extra_train_state.last_grads, util.zero_tree(grads), \
+                optax.safe_int32_increment(extra_train_state.num_inf_grads), extra_train_state.random_scalar
+        
+        def extra_state_if_finite(_):
+            # Standard case when grads are finite.
+            return updates, grads, grads, extra_train_state.num_inf_grads, extra_logs['update/random_scaling']
+        
+        new_params_diff, new_last_grads, grads, new_num_inf_grads, new_random_scalar = jax.lax.cond(
+            util.is_finite_tree(grads), extra_state_if_finite, extra_state_if_nan, operand=None)
+
+        # Compute online learner instantaneous loss: <grad_n, Delta_n>
+        last_delta = util.tree_scalar_multiply(
+            extra_train_state.params_diff, 1/extra_train_state.random_scalar)
+        loss_ol = util.tree_inner_product(grads, last_delta)
+        cumulative_loss_ol = extra_train_state.cumulative_loss_ol + loss_ol
+
+        log_data.update({
+            "update/online_learner:instant_loss": loss_ol,
+            "update/online_learner:cumulative_loss": cumulative_loss_ol,
+        })
+
+        # Compute optimization loss gap f(x_n, z_n) - f(x_{n-1}, z_n)
+        last_model = eqx.apply_updates(
+            model, util.negative_tree(extra_train_state.params_diff))
+        last_loss, _ = loss_fn(last_model, batch, key)
+        loss_diff = loss - last_loss
+        cumulative_loss_optim = extra_train_state.cumulative_loss_optim + loss_diff
+
+        log_data.update({
+            "update/optim:loss_diff": loss_diff,
+            "update/optim:cumulative_loss": cumulative_loss_optim,
+        })
+
+        # Gradient measures: <g_n, g_{n-1}> and <g_n, g_{1:n-1}>
+        log_data.update({
+            "grads/<gn, g(n-1)>": util.tree_inner_product(grads, extra_train_state.last_grads),
+            "grads/<gn, g(1:n-1)>": util.tree_inner_product(grads, extra_train_state.sum_grads),
+            "grads/cos(gn, g(n-1))": util.tree_cosine_similarity(grads, extra_train_state.last_grads),
+            "grads/cos(gn, g(1:n-1))": util.tree_cosine_similarity(grads, extra_train_state.sum_grads),
+            "grads/inf_grads": extra_train_state.num_inf_grads,
+        })
+
+        # Update extra_train_state.
+        sum_grads = util.tree_add(extra_train_state.sum_grads, grads)
+        new_extra_train_state = ExtraTrainState(
+            params_diff=new_params_diff,
+            last_grads=new_last_grads,
+            sum_grads=sum_grads,
+            random_scalar=new_random_scalar,
+            cumulative_loss_ol=cumulative_loss_ol,
+            cumulative_loss_optim=cumulative_loss_optim,
+            num_inf_grads=new_num_inf_grads,
+        )
+    else:
+        new_extra_train_state = None
+
+    return loss, accuracy, log_data, new_train_state, new_extra_train_state
 
 
 def train_loop(
     train_state: TrainState,
+    extra_train_state: Optional[ExtraTrainState],
     optimizer: Any,
     dataloader: Any,
     config: DictConfig,
@@ -368,21 +451,19 @@ def train_loop(
         input_ids = jnp.asarray(batch["input_ids"])
         labels = jnp.asarray(batch["labels"])
         to_use, key = jr.split(key)
-
-        # Logging message.
         tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
         samples = labels.shape[0]
         time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
 
         # Apply one-step train_step.
-        loss, accuracy, log_data, train_state = train_step_jit(
-            train_state, (input_ids, labels), optimizer, key=key
+        loss, accuracy, log_data, train_state, extra_train_state = train_step_jit(
+            train_state, extra_train_state, (input_ids, labels), optimizer, key=key
         )
-
-        # Update logger. (can be ignored for now...)
         time_keeper.mark(
             end_events={"train_step": 1},
         )
+
+        # Update loss and accuracy.
         running_loss = beta * running_loss + (1.0 - beta) * loss
         total_tokens += tokens
         running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
@@ -390,6 +471,9 @@ def train_loop(
             f"train iter: {it}, tokens: {total_tokens}, loss: {loss:.2f}, accuracy: {accuracy:.4f}, running_loss: {running_loss/(1.0-beta**(it+1)):.2f}, running_accuracy: {running_accuracy/(1.0-beta**(it+1)):.4f}"
         )
 
+        # ======================================================================
+        # BELOW UPDATES ADDITIONAL LOG MESSAGES...
+        # Basic states.
         metrics = {
             "iterations": train_state.iteration,
             "loss": loss,
@@ -398,6 +482,7 @@ def train_loop(
         }
         metrics.update(log_data)
 
+        # Time complexity related statistics.
         time_keeper.mark(
             start_events=["dataloader", "iteration", "tokens", "samples"],
             end_events={"iteration": 1, "tokens": tokens, "samples": samples},
@@ -467,7 +552,19 @@ def train(config: DictConfig) -> None:
         model=model,
         opt_state=opt_state,
         dynamic_scaler_state=dynamic_scaler_state,
-        iteration=jnp.array(0),
+        iteration=jnp.array(0)
+    )
+
+    # Extra train state for logging purpose.
+    zeros = util.zero_tree(eqx.filter(model, eqx.is_array))
+    extra_train_state = None if not config.train.log_extra else ExtraTrainState(
+        params_diff=zeros,
+        last_grads=zeros,
+        sum_grads=zeros,
+        random_scalar=jnp.ones([]),
+        cumulative_loss_ol=jnp.zeros([]),
+        cumulative_loss_optim=jnp.zeros([]),
+        num_inf_grads=jnp.zeros([], jnp.int32),
     )
 
     key = jr.PRNGKey(0)
@@ -476,6 +573,7 @@ def train(config: DictConfig) -> None:
 
     train_loop(
         train_state,
+        extra_train_state,
         optimizer,
         train_loader,
         config,
@@ -504,113 +602,6 @@ def test(config: DictConfig) -> None:
 
     # print(optimizer)
     optimizer.update(updates, opt_state, params)
-    # for i in range(3):
-    #     updates, opt_state = optimizer.update(updates, opt_state, params)
-    #     params = optax.apply_updates(params, updates)
-    #     print(f"round{i+1} new params:\n", params)
-
-    # if config.train.use_amp:
-    #     dynamic_scaler_state = DynamicScalerState()
-    # else:
-    #     dynamic_scaler_state = None
-
-    # train_state = TrainState(
-    #     model=model,
-    #     opt_state=opt_state,
-    #     dynamic_scaler_state=dynamic_scaler_state,
-    #     iteration=jnp.array(0),
-    # )
-
-    # key = jr.PRNGKey(0)
-
-    # time_keeper = TimeKeeper()
-
-    # print("="*100)
-    # print("Start training loop...")
-    # pbar = tqdm.tqdm(enumerate(train_loader), total=config.train.max_steps)
-
-    # running_loss, running_accuracy, total_tokens = 0, 0, 0
-    
-    # train_step_jit = eqx.filter_jit(
-    #     jtu.Partial(train_step, config=config.train),
-    # )
-    # Just-in-time compilation of the train_step(..., config=config.train) function.
-    # [jax.jit](https://jax.readthedocs.io/en/latest/jax-101/02-jitting.html)
-    # [eqx.filter_jit](https://docs.kidger.site/equinox/api/transformations/#equinox.filter_jit)
-    # [jtu.Partial](https://jax.readthedocs.io/en/latest/_autosummary/jax.tree_util.Partial.html)
-    
-    # # Initialize Wandb Logger
-    # beta = 1.0 - 1.0 / config.train.running_stats_window
-    # iteration_timing_events = ["iteration", "dataloader", "train_step"]
-    # time_keeper.mark(start_events=["dataloader", "iteration", "tokens", "samples"])
-
-    # for it, batch in pbar:
-    #     print("TRAINING...")
-    #     if it > 3:
-    #         break
-    #     # Load training batch.
-    #     input_ids = jnp.asarray(batch["input_ids"])
-    #     labels = jnp.asarray(batch["labels"])
-    #     to_use, key = jr.split(key)
-
-    #     # Logging message.
-    #     tokens = jnp.sum(jnp.asarray(batch["attention_mask"]))
-    #     samples = labels.shape[0]
-    #     time_keeper.mark(end_events={"dataloader": 1}, start_events=["train_step"])
-
-        # # Apply one-step train_step.
-        # loss, accuracy, log_data, train_state = train_step_jit(
-        #     train_state, (input_ids, labels), optimizer, key=key
-        # )
-
-        # # Update logger. (can be ignored for now...)
-        # time_keeper.mark(
-        #     end_events={"train_step": 1},
-        # )
-        # running_loss = beta * running_loss + (1.0 - beta) * loss
-        # total_tokens += tokens
-        # running_accuracy = beta * running_accuracy + (1 - beta) * accuracy
-        # pbar.set_description(
-        #     f"train iter: {it}, tokens: {total_tokens}, loss: {loss}, accuracy: {accuracy}, running_loss: {running_loss/(1.0-beta**(it+1))}, running_accuracy: {running_accuracy/(1.0-beta**(it+1))}"
-        # )
-
-        # metrics = {
-        #     "iterations": train_state.iteration,
-        #     "loss": loss,
-        #     "total_tokens": total_tokens,
-        #     "accuracy": accuracy,
-        # }
-        # metrics.update(log_data)
-
-        # time_keeper.mark(
-        #     start_events=["dataloader", "iteration", "tokens", "samples"],
-        #     end_events={"iteration": 1, "tokens": tokens, "samples": samples},
-        # )
-        # durations = time_keeper.get_durations()
-        # proportions = time_keeper.get_proportions()
-        # metrics.update(
-        #     {
-        #         f"time/secs_per/{k}": durations[k]
-        #         for k in iteration_timing_events
-        #         if k in durations
-        #     }
-        # )
-        # metrics.update(
-        #     {
-        #         f"time/fraction_spent/{k}": proportions[k]
-        #         for k in iteration_timing_events
-        #         if k in proportions
-        #     }
-        # )
-
-        # if "iteration" in durations:
-        #     throughput = {
-        #         "throughput/iteration_per_sec": 1.0 / durations["iteration"],
-        #         "throughput/samples_per_sec": 1.0 / durations["samples"],
-        #         "throughput/tokens_per_sec": 1.0 / durations["tokens"],
-        #     }
-        #     metrics.update(throughput)
-
 
 
 if __name__ == "__main__":

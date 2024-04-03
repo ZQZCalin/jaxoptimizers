@@ -21,7 +21,6 @@ for lib in libraries:
     try:
         # Dynamically import the module
         module = importlib.import_module(lib)
-        
         # Attempt to print the version
         print(f"{lib}: {module.__version__}")
     except ImportError as err:
@@ -30,13 +29,11 @@ for lib in libraries:
     except AttributeError:
         print(f"{lib}: Version not accessible via __version__")
 
-import torch
-
 
 # Check if CUDA is available.
 print(divider+"\nchecking cuda state...")
+import torch
 print("CUDA Available:", torch.cuda.is_available())
-
 # List all available GPUs
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):

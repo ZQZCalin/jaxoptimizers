@@ -29,6 +29,9 @@ train:
   # Still working on nice way to do this logging - we really should only incur one communication
   # round per iteration and I don't think the logging data should significantly impact it.
   log_callback_data: True
+
+  # if true, logs additional statistics such as F(x_t)-F(x_{t-1}), <\nabla F(x_t), Delta_t>, etc.
+  log_extra: True
   
   running_stats_window: 1000
 
@@ -40,27 +43,22 @@ train:
   dataloader_workers: 2
 
 optimizer:
-  # learning rate scheduler
-  lr: 1e-4
-  lr_schedule: "cosine"
-  lr_warmup: 5000
-
   # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
   wrap_o2nc: "o2nc"
 
   # PRNGKey seed for random scaling
   seed: 0
 
-  # random scaling function. values in ["exponential", ...]
+  # random scaling function. values in ["deterministic", "exponential", ...]
   random_scaling: "exponential"
 
-  # regularization constants 
-  # NOTE: exponentiation should be specified in online learner since each online learner
-  # implements exponentiated gradient in its own way.
-  # weight_decay: 0.01
+  # learning rate scheduler
+  lr: 0.01
+  lr_schedule: "cosine"
+  lr_warmup: 5000
 
   # base online learner. currently supports
-  # ["unconstrained_ogd", "ada_ftrl", "blackbox_ftrl"]
+  # ["ada_ftrl", "normalized_blackbox", "ogd_mirror_descent"]
   # Ada-FTRL
   # online_learner: "ada_ftrl"
   # ol_config:
@@ -71,13 +69,19 @@ optimizer:
   #   scale_lr: False 
   #   scale_eps: False
   # Blackbox FTRL
-  online_learner: "normalized_blackbox"
+  # Commented on 2024/03/28
+  # online_learner: "normalized_blackbox"
+  # ol_config:
+  #   magnitude_learner: "kt"
+  #   eps: 5
+  #   Lipschitz: 20
+  #   beta: 1.0
+  #   weight_decay: 0.0
+  #   per_layer: True
+  online_learner: "ogd_mirror_descent"
   ol_config:
-    magnitude_learner: "kt"
-    eps: 5
-    Lipschitz: 20
     beta: 1.0
-    weight_decay: 0.0
+    mu: 0.0
 
 
 benchmark:
