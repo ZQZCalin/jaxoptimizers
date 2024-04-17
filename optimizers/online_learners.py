@@ -1,9 +1,4 @@
-"""Online convex optimization algorithms.
-
-Currently the following list of functions follow this format:
-    - `ada_ftrl`
-    - `kt_bettor`
-"""
+"""Online convex optimization algorithms."""
 
 import jax
 from jax import numpy as jnp
@@ -19,6 +14,7 @@ import util
 from util import tree_add, tree_subtract, tree_multiply, tree_scalar_multiply, tree_dot, tree_norm, tree_normalize, check_tree_structures_match
 from logger import RateLimitedWandbLog
 import logstate
+import scheduler
 
 
 class OnlineLearnerInitFn(Protocol):
@@ -40,7 +36,7 @@ class OnlineLearnerUpdateFn(Protocol):
         self, 
         grads: Updates, 
         state: OptState,
-        params: Optional[Params]
+        params: Optional[Params] = None,
     ) -> Tuple[Params, OptState]:
         """The `update` function.
 
@@ -52,6 +48,17 @@ class OnlineLearnerUpdateFn(Protocol):
         Returns:
             The new parameter w_{t+1}, and the updated state.
         """
+
+
+class OnlineLearnerUpdateExtraArgsFn(Protocol):
+    def __call__(
+        self,
+        grads: Updates,
+        state: OptState,
+        params: Optional[Params] = None,
+        **extra_args: Any,
+    ) -> Tuple[Params, OptState]:
+        """OnlineLearner update function with extra arguments (e.g., for FTRL)."""
 
 
 class OnlineLearner(NamedTuple):
@@ -73,7 +80,7 @@ class OnlineLearner(NamedTuple):
         Regret_T(u) <= D^2 / eta_{T+1} + sum_{t=1}^T eta_t * |g_t|^2.
     With g_t replaced by tilde g_t (with mu=0 for simplicity), we can check that eta_t = eta * beta^t
     actually finds the optimal "modified" regret of order O(D^2/eta + eta/(1-beta)) for any unknown T.
-    If we combine the learning rate with the gradient tilde g_t, we realize the exponentials cancel each out, and the update
+    If we combine the learning rate with the gradient tilde g_t, note that the exponentials cancel each out and the update
     remains to be w_{t+1} = w_t - eta * (g_t + mu*w_t), which is exactly the standard OGD (with weight decay).
 
     Unlike typical optax GradientTransformations, upon calling the update function, an OnlineLearner returns the 
@@ -84,6 +91,14 @@ class OnlineLearner(NamedTuple):
     """
     init: OnlineLearnerInitFn
     update: OnlineLearnerUpdateFn
+
+
+class OnlineLearnerExtraArgs(OnlineLearner):
+    """Online learner with extra arguments (e.g., FTRL).
+    
+    Overwrites the update function in base OnlineLearner class.
+    """
+    update: OnlineLearnerUpdateExtraArgsFn
 
 
 class ScaleByOnlineLearnerState(NamedTuple):
@@ -181,7 +196,7 @@ def wrap_online_learner(
     def update_fn(updates, state, params=None):
         del params
         new_params, state = online_learner.update(updates, state.state, state.params)
-        return WrapOnlineLearnerState(params=new_params, state=state)
+        return new_params, WrapOnlineLearnerState(params=new_params, state=state)
 
     return OnlineLearner(init_fn, update_fn)
 
@@ -189,18 +204,6 @@ def wrap_online_learner(
 # ======================================================================
 # Below implements popular online learners.
 # ======================================================================
-
-
-def get_current_lr(
-    learning_rate: ScalarOrSchedule,
-    count: chex.Array,
-):
-    """Returns the current learning rate."""    
-    if callable(learning_rate):
-        return learning_rate(count)
-    else:
-        return learning_rate
-
 
 class OGDState(NamedTuple):
     """ogd state."""
@@ -231,7 +234,7 @@ def ogd(
             lambda g, w: g + weight_decay*w, updates, params)
         # gradient descent
         count_inc = optax.safe_int32_increment(state.count)
-        eta = get_current_lr(learning_rate, state.count)
+        eta = scheduler.get_current_lr(learning_rate, state.count)
         new_params = jtu.tree_map(
             lambda w, g: w - eta*g, params, grads)
         return new_params, OGDState(count=count_inc)
@@ -262,18 +265,28 @@ def ogd_mirror_descent(
         OnlineLearner: _description_
     """
 
-    def init_fn(params):
+    def init_fn(params=None):
         del params
         return OGDMirrorDescentState(count=jnp.zeros([], jnp.int32))
     
     def update_fn(updates, state, params):
         count_inc = optax.safe_int32_increment(state.count)
-        eta = get_current_lr(learning_rate, state.count)
+        eta = scheduler.get_current_lr(learning_rate, state.count)
         new_params = jtu.tree_map(
             lambda w, g: (w - eta*g) * beta/(1+eta*mu), params, updates)
         return new_params, OGDMirrorDescentState(count=count_inc)
     
     return OnlineLearner(init_fn, update_fn)
+
+
+# TODO: 
+# SGDM with constant beta schedule.
+# 1. ogd_md with hints 
+# 2. ogd_md with different learning rates: adaptive lr, other schedulers...
+# Q: is cosine scheduler important to achieve a good performance? If so, why is the reason; if not, can we replace with other lr schedulers?
+# and with optimistic online learners.
+# 3. FTRL
+
 
 
 class UnconstrainedOGDState(NamedTuple):
@@ -327,6 +340,26 @@ def unconstrained_ogd(
             count=count_inc, Delta=new_Delta)
     
     return GradientTransformation(init_fn, update_fn)
+
+
+class FTRLState(NamedTuple):
+    """ftrl state."""
+
+
+def ftrl() -> OnlineLearnerExtraArgs:
+    """Family of Follow-the-regularized-leader algorithms.
+
+    Updates w_{t+1} = argmin_w psi_t(w) + sum_{i=1}^t ell_i(w),
+        where psi_t is a linearized regularizer of form <r_t, w> and ell_t is a linearized loss of form <g_t, w>.
+    """
+
+    def init_fn(params):
+        return FTRLState()
+    
+    def update_fn(grads, state, params):
+        return new_params, FTRLState()
+    
+    return OnlineLearnerExtraArgs(init_fn, update_fn)
 
 
 class AdaFTRLState(NamedTuple):
@@ -661,3 +694,44 @@ def normalized_blackbox(
     
     return OnlineLearner(init_fn, update_fn)
 
+
+# ======================================================================
+# Below implements online learner conversion algorithms.
+# ======================================================================
+
+class ImperfectHintsState(NamedTuple):
+    """imperfect_hints state."""
+    sum_lam: chex.Array         # regularization constant
+    sum_sigma: chex.Array
+    r_square: chex.Array        # sum of square of negative correlation
+    last_hint: Updates
+    ol_state: OptState
+
+
+def imperfect_hints(
+    online_learner: OnlineLearner,
+    mu: float = 1.0,
+) -> OnlineLearner:
+    
+    def init_fn(params):
+        return ImperfectHintsState(
+            sum_lam=jnp.Array([1/mu]),
+            sum_square=jnp.zeros([]),
+            r_square=jnp.ones([]),
+            last_hint=util.zero_tree(params),
+            ol_state=online_learner.init(params),
+        )
+    
+    def update_fn(grads, state, params):
+        hint_grad_inner = util.tree_inner_product(grads, state.last_hint)
+        r_square = jax.lax.cond(
+            hint_grad_inner < 0, 
+            lambda _: state.r_square - hint_grad_inner, 
+            lambda _: state.r_square, 
+            operand=None
+        )
+        sigma = jax.abs(hint_grad_inner) * mu / state.r_square
+        
+        return new_params, ImperfectHintsState()
+    
+    return OnlineLearner(init_fn, update_fn)

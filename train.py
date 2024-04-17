@@ -19,6 +19,7 @@ import equinox as eqx
 from jax import Array
 from jaxamp import amp, DynamicScalerState, dynamic_scale_value_and_grad
 from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
+import copy
 
 import tqdm
 import wandb
@@ -31,14 +32,23 @@ import logstate
 from logger import TimeKeeper, RateLimitedWandbLog
 from model.gpt import GPT
 from loader.c4_loader import get_c4_loader_next_token
+from loader.pile_loader import get_pile_loader_next_token
+from loader.lm_loader import get_lm_loader_next_token
 
 import sys
 sys.path.append('./optimizers')
-from optimizers.o2nc import adamw, online_nonconvex
+from optimizers.o2nc import online_nonconvex, deterministic_online_nonconvex, wrap_random_scaling
 import optimizers.online_learners as ol
+import optimizers.benchmark as benchmark
+import optimizers.scheduler as scheduler
+import optimizers.optim as optim
 
 
 divider = "="*100
+
+
+def alert_message(msg):
+    print(f">>> Alert!: {msg}")
 
 
 class TrainState(NamedTuple):
@@ -79,7 +89,49 @@ def load_c4_data(config: DictConfig, tokenizer: Any, split: str = "train"):
         max_length=config.model.context_length,
         pad_to_multiple_of=config.model.context_length,
         num_workers=config.train.dataloader_workers,
-        ds_path=config.train.data_path,
+        # Note: currently ds_path is NOT passed in the actual data_loader
+        # ds_path=config.train.data_path,
+    )
+    return loader
+
+
+def load_pile_data(config: DictConfig, tokenizer: Any, split: str = "train"):
+    """Wrapper for Pile dataset.
+
+    Args:
+        config (DictConfig): _description_
+        tokenizer (Any): _description_
+        split (str, optional): _description_. Defaults to "train".
+
+    Returns:
+        torch.utils.data.DataLoader: Pile train/test dataloader.
+    """
+    loader = get_pile_loader_next_token(
+        tokenizer,
+        split=split,
+        batch_size=config.train.batch_size,
+        max_length=config.model.context_length,
+        pad_to_multiple_of=config.model.context_length,
+        num_workers=config.train.dataloader_workers,
+        # ds_path=config.train.data_path,
+    )
+    return loader
+
+
+def load_lm_data(config: DictConfig, tokenizer: Any, split: str = "train"):
+    """Wrapper for Pile dataset.
+
+    Returns:
+        torch.utils.data.DataLoader.
+    """
+    loader = get_lm_loader_next_token(
+        tokenizer,
+        split=split,
+        batch_size=config.train.batch_size,
+        max_length=config.model.context_length,
+        pad_to_multiple_of=config.model.context_length,
+        num_workers=config.train.dataloader_workers,
+        dataset=config.train.dataset,
     )
     return loader
 
@@ -120,20 +172,34 @@ def init_scheduler(
     Returns:
         optax.ScalarOrSchedule.
     """
-    if config.lr_schedule == "constant":
+    use_warmup = type(config.warmup)==int
+    if config.schedule == "constant":
         learning_rate = config.lr
-    elif config.lr_schedule == "cosine":
-        if config.lr_warmup:
+    elif config.schedule == "cosine":
+        if use_warmup:
             learning_rate = optax.warmup_cosine_decay_schedule(
-                init_value=.0,
+                init_value=0.0,
                 peak_value=config.lr,
-                warmup_steps=config.lr_warmup,
-                decay_steps=max_steps
+                warmup_steps=config.warmup,
+                decay_steps=max_steps,
             )
         else:
             learning_rate = optax.cosine_decay_schedule(
                 init_value=config.lr,
-                decay_steps=max_steps
+                decay_steps=max_steps,
+            )
+    elif config.schedule == "linear":
+        if use_warmup:
+            learning_rate = scheduler.warmup_linear_decay_schedule(
+                init_value=0.0,
+                peak_value=config.lr,
+                warmup_steps=config.warmup,
+                decay_steps=max_steps,
+            )
+        else:
+            learning_rate = scheduler.linear_decay_schedule(
+                init_value=config.lr,
+                decay_steps=max_steps,
             )
     return learning_rate
 
@@ -159,21 +225,15 @@ def init_optimizer(
 ):
     """Construct optimizer from model and training config.
 
-    Args:
-        model: _description_
-        config: _description_
-        logger: _description_
-
     Returns:
-        _type_: _description_
-        _type_: _description_
+        Initial optimizer and opt_state.
     """
     max_steps = config.train.max_steps
     gradient_clip_val = config.train.gradient_clip_val
-    run_benchmark = config.benchmark.run_benchmark
+    run_benchmark = config.train.run_benchmark
     
     # Learning rate scheduler.
-    lr_config = config.benchmark if run_benchmark else config.optimizer
+    lr_config = config.benchmark.lr_config if run_benchmark else config.optimizer.lr_config
     learning_rate = init_scheduler(max_steps, lr_config)
 
     # Wrap scheduler to log learning rate to wandb.
@@ -184,46 +244,70 @@ def init_optimizer(
         # Run Adamw as the benchmark
         print("====================== NOTE: RUNNING BENCHMARK ======================")
         benchmark_config = config.benchmark
-        if benchmark_config.use_default:
+        if benchmark_config.optim == "adamw":
+            adamw_config = benchmark_config.adamw_config
+            optimizer = benchmark.adamw(
+                learning_rate=learning_rate,
+                beta1=adamw_config.beta1,
+                beta2=adamw_config.beta2,
+                weight_decay=adamw_config.weight_decay,
+                debias_beta1=adamw_config.debias_beta1,
+                debias_beta2=adamw_config.debias_beta2,
+            )
+        elif benchmark_config.optim == "sgdm":
+            sgdm_config = benchmark_config.sgdm_config
+            optimizer = benchmark.sgdm(
+                learning_rate=learning_rate,
+                beta=sgdm_config.beta,
+                weight_decay=sgdm_config.weight_decay,
+            )
+        elif benchmark_config.optim == "polar":
+            polar_config = benchmark_config.polar
+            optimizer = optim.polar_descent(
+                direction_lr=learning_rate,
+                magnitude_lr=learning_rate,
+                b1=polar_config.b1,
+                b2=polar_config.b2,
+                eps=polar_config.eps,
+                direction_wd=polar_config.direction_wd,
+                magnitude_wd=polar_config.magnitude_wd,
+            )
+        else:
+            # Default optax adamw optimizer.
+            alert_message("Benchmark optimzier is not specified. Defaults to optim.adamw.")
             optimizer = optax.adamw(
                 learning_rate=learning_rate,
                 b1=benchmark_config.beta1,
                 b2=benchmark_config.beta2,
                 weight_decay=benchmark_config.weight_decay,
             )
-        else:
-            optimizer = adamw(
-                learning_rate=learning_rate,
-                beta1=benchmark_config.beta1,
-                beta2=benchmark_config.beta2,
-                weight_decay=benchmark_config.weight_decay,
-                debias_beta1=benchmark_config.debias_beta1,
-                debias_beta2=benchmark_config.debias_beta2,
-            )
     else:
         # Run online-to-nonconvex conversion.
-        print("====================== NOTE: NORMAL O2NC ======================")
+        print("====================== NOTE: RUNNING O2NC ======================")
         optim_config = config.optimizer
-        ol_config = config.optimizer.ol_config
         print(f">>> Online learner: {optim_config.online_learner}")
         if optim_config.online_learner == "ogd_mirror_descent":
+            ol_config = optim_config.ogd_md_config
             online_learner = ol.ogd_mirror_descent(
                 learning_rate=learning_rate,
                 beta=ol_config.beta,
                 mu=ol_config.mu,
             )
         elif optim_config.online_learner == "ada_ftrl":
+            ol_config = optim_config.ada_ftrl_config
             online_learner = ol.ada_ftrl(
                 learning_rate=learning_rate,
                 **ol_config
             )
-        elif optim_config.online_learner == "blackbox_ftrl":
-            online_learner = ol.blackbox_reduction(
-                magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
-                direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
-                weight_decay=ol_config.weight_decay,
-            )
+        # elif optim_config.online_learner == "blackbox_ftrl":
+        #     ol_config = config.optimizer.ol_config
+        #     online_learner = ol.blackbox_reduction(
+        #         magnitude_learner=ol.kt_bettor(eps=ol_config.eps),
+        #         direction_learner=ol.blackbox_ftrl(beta=ol_config.beta),
+        #         weight_decay=ol_config.weight_decay,
+        #     )
         elif optim_config.online_learner == "normalized_blackbox":
+            ol_config = optim_config.kt_blackbox_config
             online_learner = ol.normalized_blackbox(
                 base_learner=ol.kt_bettor(
                     eps=ol_config.eps, 
@@ -235,61 +319,46 @@ def init_optimizer(
                 per_layer=ol_config.per_layer,
             )
         else:
-            online_learner = ol.ogd(
-                learning_rate=learning_rate,
-                weight_decay=ol_config.weight_decay
-            )
+            # Default online learner set to OGD.
+            alert_message("Online learner is not specified. Defaults to OGD.")
+            online_learner = ol.ogd(learning_rate=learning_rate)
 
-        # print(divider+"\ntesting online learner.......")
-        # ol.test_online_learner(online_learner)
-        # print("\ntest finished.\n"+divider)
-
+        # TODO: deprecate and use separated o2nc and random scaling
         # Random scaling function.
-        exponential_scaling = lambda key: jr.exponential(key)
-        uniform_scaling = lambda key: jr.uniform(key, minval=0, maxval=2)
-        no_scaling = lambda key: jnp.ones([])
+        # exponential_scaling = lambda key: jr.exponential(key)
+        # uniform_scaling = lambda key: jr.uniform(key, minval=0, maxval=2)
+        # no_scaling = lambda key: jnp.ones([])
 
-        if optim_config.random_scaling == "deterministic":
-            random_scaling = no_scaling
-        elif optim_config.random_scaling == "exponential":
-            random_scaling = exponential_scaling
-        elif optim_config.random_scaling == "uniform":
-            random_scaling = uniform_scaling
-        else:
-            print("*** Alert: no randomized scaling is applied!")
-            random_scaling = no_scaling
+        # if optim_config.random_scaling == "none":
+        #     random_scaling = no_scaling
+        # elif optim_config.random_scaling == "exponential":
+        #     random_scaling = exponential_scaling
+        # elif optim_config.random_scaling == "uniform":
+        #     random_scaling = uniform_scaling
+        # else:
+        #     print("*** Alert: no randomized scaling is applied!")
+        #     random_scaling = no_scaling
 
         # Wrap base online learner with (Exponentiated) O2NC.
-        optimizer = online_nonconvex(
-            online_learner=online_learner,
-            random_scaling=random_scaling,
-            seed=optim_config.seed,
-        )
-        
-        # NOTE: for now, we always wrap with the above more specific wrapper.
-        # if optim_config.wrap_o2nc == "o2nc":
-        #     optimizer = online_nonconvex(
-        #         online_learner=online_learner,
-        #         random_scaling=random_scaling,
-        #         seed=optim_config.optimizer.seed,
-        #     )
-        # elif config.wrap_o2nc == "eo2nc":
-        #     optimizer = eo2nc(online_learner, config.seed)
-
-        # print(divider+"\ntesting wrapped o2nc......")
-        # test_optimizer(optimizer)
-        # print("finish testing.\n"+divider)
+        # optimizer = online_nonconvex(
+        #     online_learner=online_learner,
+        #     random_scaling=random_scaling,
+        #     seed=optim_config.random_scaling_seed,
+        # )
+        optimizer = deterministic_online_nonconvex(online_learner)
 
     # Gradient clipping and NaN wrapper.
+    optimizer = wrap_random_scaling(
+        gradient_transformation=optimizer,
+        random_scaling=config.train.random_scaling,
+        seed=config.train.random_scaling_seed
+    )
+    
     grad_clip = optax.clip_by_global_norm(gradient_clip_val)
     optimizer = optax.chain(
         grad_clip,
         optax.apply_if_finite(optimizer, 15)
     )
-
-    # print(divider+"\ntesting final optimizer......")
-    # test_optimizer(optimizer)
-    # print("finish testing.\n"+divider)
 
     # Initialize opt_state
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -340,8 +409,8 @@ def train_step(
         "grads/norm": tree_norm(grads),
         "grads/l1-norm": util.tree_l1_norm(grads),
     }
-    extra_logs = util.merge_dicts(*logstate.list_of_logs(opt_state))
-    log_data.update(extra_logs)
+    optim_logs = util.merge_dicts(*logstate.list_of_logs(opt_state))
+    log_data.update(optim_logs)
 
     # Update new train_state.
     new_train_state = TrainState(
@@ -351,68 +420,121 @@ def train_step(
         iteration=train_state.iteration + 1
     )
 
-    # TODO: debug current logging methods and add new logs if needed.
-    # Compute additional log statistics.
-    if config.log_extra:
-        # Handle possible infinite grads.
-        def extra_state_if_nan(_):
-            # Special case handler when grads=nan:
-            # keep params_diff, random_scalar and last_grads from last iteration and treat new grads as zeros.
-            return extra_train_state.params_diff, extra_train_state.last_grads, util.zero_tree(grads), \
-                optax.safe_int32_increment(extra_train_state.num_inf_grads), extra_train_state.random_scalar
-        
-        def extra_state_if_finite(_):
-            # Standard case when grads are finite.
-            return updates, grads, grads, extra_train_state.num_inf_grads, extra_logs['update/random_scaling']
-        
-        new_params_diff, new_last_grads, grads, new_num_inf_grads, new_random_scalar = jax.lax.cond(
-            util.is_finite_tree(grads), extra_state_if_finite, extra_state_if_nan, operand=None)
+    # Log additional training data.
+    log_grads = config.log_config.grads
+    log_loss = config.log_config.loss
+    log_loss_ol = (not config.run_benchmark) and log_loss
+
+    extra_logs_template = {
+        "update/online_learner:instant_loss": jnp.zeros([]),
+        "update/online_learner:cumulative_loss": jnp.zeros([]),
+        "update/optim:loss_diff": jnp.zeros([]),
+        "update/optim:cumulative_loss": jnp.zeros([]),
+        "grads/<gn, g(n-1)>": jnp.zeros([]),
+        "grads/<gn, g(1:n-1)>": jnp.zeros([]),
+        "grads/cos(gn, g(n-1))": jnp.zeros([]),
+        "grads/cos(gn, g(1:n-1))": jnp.zeros([]),
+        "grads/<gn, xn-x(n-1)>": jnp.zeros([]),
+        "grads/inf_grads": jnp.zeros([], jnp.int32),
+    }
+
+    def log_if_nan(_):
+        """Returns a pair of new_extra_train_state and extra_logs when grads=nan."""
+        new_extra_train_state = extra_train_state._replace(
+            num_inf_grads = optax.safe_int32_increment(extra_train_state.num_inf_grads)
+        )
+        # TODO: right now we need a dummy copy of extra_logs, which is kinda dumb.
+        # need a more clever way to deal with logs.
+        extra_logs = copy.deepcopy(extra_logs_template)
+        return new_extra_train_state, extra_logs
+    
+    def log_if_finite(_):
+        """Returns a pair of new_extra_train_state and extra_logs when grads is finite."""
+        extra_logs = copy.deepcopy(extra_logs_template)
 
         # Compute online learner instantaneous loss: <grad_n, Delta_n>
-        last_delta = util.tree_scalar_multiply(
-            extra_train_state.params_diff, 1/extra_train_state.random_scalar)
-        loss_ol = util.tree_inner_product(grads, last_delta)
-        cumulative_loss_ol = extra_train_state.cumulative_loss_ol + loss_ol
+        if log_loss_ol:
+            last_delta = util.tree_scalar_multiply(
+                extra_train_state.params_diff, 1/extra_train_state.random_scalar)
+            loss_ol = util.tree_inner_product(grads, last_delta)
+            cumulative_loss_ol = extra_train_state.cumulative_loss_ol + loss_ol
+            new_random_scalar = optim_logs['update/random_scaling']
 
-        log_data.update({
-            "update/online_learner:instant_loss": loss_ol,
-            "update/online_learner:cumulative_loss": cumulative_loss_ol,
-        })
+            extra_logs.update({
+                "update/online_learner:instant_loss": loss_ol,
+                "update/online_learner:cumulative_loss": cumulative_loss_ol,
+            })
+        else:
+            cumulative_loss_ol = None
+            new_random_scalar = None
 
         # Compute optimization loss gap f(x_n, z_n) - f(x_{n-1}, z_n)
-        last_model = eqx.apply_updates(
-            model, util.negative_tree(extra_train_state.params_diff))
-        last_loss, _ = loss_fn(last_model, batch, key)
-        loss_diff = loss - last_loss
-        cumulative_loss_optim = extra_train_state.cumulative_loss_optim + loss_diff
+        if log_loss:
+            last_model = eqx.apply_updates(
+                model, util.negative_tree(extra_train_state.params_diff))
+            last_loss, _ = loss_fn(last_model, batch, key)
+            loss_diff = loss - last_loss
+            cumulative_loss_optim = extra_train_state.cumulative_loss_optim + loss_diff
 
-        log_data.update({
-            "update/optim:loss_diff": loss_diff,
-            "update/optim:cumulative_loss": cumulative_loss_optim,
-        })
+            extra_logs.update({
+                "update/optim:loss_diff": loss_diff,
+                "update/optim:cumulative_loss": cumulative_loss_optim,
+            })
+        else:
+            cumulative_loss_optim = None
 
         # Gradient measures: <g_n, g_{n-1}> and <g_n, g_{1:n-1}>
-        log_data.update({
-            "grads/<gn, g(n-1)>": util.tree_inner_product(grads, extra_train_state.last_grads),
-            "grads/<gn, g(1:n-1)>": util.tree_inner_product(grads, extra_train_state.sum_grads),
-            "grads/cos(gn, g(n-1))": util.tree_cosine_similarity(grads, extra_train_state.last_grads),
-            "grads/cos(gn, g(1:n-1))": util.tree_cosine_similarity(grads, extra_train_state.sum_grads),
-            "grads/inf_grads": extra_train_state.num_inf_grads,
-        })
+        if log_grads:
+            new_sum_grads = util.tree_add(extra_train_state.sum_grads, grads)
+            extra_logs.update({
+                "grads/<gn, g(n-1)>": util.tree_inner_product(grads, extra_train_state.last_grads),
+                "grads/<gn, g(1:n-1)>": util.tree_inner_product(grads, extra_train_state.sum_grads),
+                "grads/cos(gn, g(n-1))": util.tree_cosine_similarity(grads, extra_train_state.last_grads),
+                "grads/cos(gn, g(1:n-1))": util.tree_cosine_similarity(grads, extra_train_state.sum_grads),
+                "grads/<gn, xn-x(n-1)>": util.tree_inner_product(grads, extra_train_state.params_diff),
+                "grads/inf_grads": extra_train_state.num_inf_grads,
+            })
+        else:
+            new_sum_grads = None
 
         # Update extra_train_state.
-        sum_grads = util.tree_add(extra_train_state.sum_grads, grads)
-        new_extra_train_state = ExtraTrainState(
-            params_diff=new_params_diff,
-            last_grads=new_last_grads,
-            sum_grads=sum_grads,
+        new_extra_train_state = extra_train_state._replace(
+            params_diff=updates if (log_grads or log_loss) else None,
+            last_grads=grads if log_grads else None,
+            sum_grads=new_sum_grads,
             random_scalar=new_random_scalar,
             cumulative_loss_ol=cumulative_loss_ol,
             cumulative_loss_optim=cumulative_loss_optim,
-            num_inf_grads=new_num_inf_grads,
         )
-    else:
-        new_extra_train_state = None
+        return new_extra_train_state, extra_logs
+    
+    new_extra_train_state, extra_logs = jax.lax.cond(
+        util.is_finite_tree(grads), log_if_finite, log_if_nan, operand=None)
+    
+    # Merge effective additional_log into log_data
+    effective_keys = []
+    if log_grads:
+        effective_keys += [
+            "grads/<gn, g(n-1)>",
+            "grads/<gn, g(1:n-1)>",
+            "grads/cos(gn, g(n-1))",
+            "grads/cos(gn, g(1:n-1))",
+            "grads/<gn, xn-x(n-1)>",
+            "grads/inf_grads",
+        ]
+    if log_loss:
+        effective_keys += [
+            "update/optim:loss_diff",
+            "update/optim:cumulative_loss",
+        ]
+    if log_loss_ol:
+        effective_keys += [
+            "update/online_learner:instant_loss",
+            "update/online_learner:cumulative_loss",
+        ]
+    log_data.update({
+        key: extra_logs[key] for key in effective_keys if key in extra_logs
+    })
 
     return loss, accuracy, log_data, new_train_state, new_extra_train_state
 
@@ -529,7 +651,11 @@ def train(config: DictConfig) -> None:
     tokenizer = transformers.GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-    train_loader = load_c4_data(config, tokenizer)
+    # if config.train.dataset == "c4":
+    #     train_loader = load_c4_data(config, tokenizer)
+    # elif config.train.dataset == "pile":
+    #     train_loader = load_pile_data(config, tokenizer)
+    train_loader = load_lm_data(config, tokenizer)
 
     # Initialize Wandb logging.
     if config.train.wandb_project is not None:
@@ -556,15 +682,27 @@ def train(config: DictConfig) -> None:
     )
 
     # Extra train state for logging purpose.
+    # extra_train_state = None if not config.train.log_extra else ExtraTrainState(
+    #     params_diff=zeros,
+    #     last_grads=zeros,
+    #     sum_grads=zeros,
+    #     random_scalar=jnp.ones([]),
+    #     cumulative_loss_ol=jnp.zeros([]),
+    #     cumulative_loss_optim=jnp.zeros([]),
+    #     num_inf_grads=jnp.zeros([], jnp.int32),
+    # )
+    log_grads = config.train.log_config.grads
+    log_loss = config.train.log_config.loss
+    log_loss_ol = (not config.train.run_benchmark) and log_loss
     zeros = util.zero_tree(eqx.filter(model, eqx.is_array))
-    extra_train_state = None if not config.train.log_extra else ExtraTrainState(
-        params_diff=zeros,
-        last_grads=zeros,
-        sum_grads=zeros,
-        random_scalar=jnp.ones([]),
-        cumulative_loss_ol=jnp.zeros([]),
-        cumulative_loss_optim=jnp.zeros([]),
-        num_inf_grads=jnp.zeros([], jnp.int32),
+    extra_train_state = ExtraTrainState(
+        params_diff = zeros if (log_grads or log_loss) else None,
+        last_grads = zeros if log_grads else None,
+        sum_grads = zeros if log_grads else None,
+        random_scalar = jnp.ones([]) if log_loss_ol else None,
+        cumulative_loss_ol = jnp.zeros([]) if log_loss_ol else None,
+        cumulative_loss_optim = jnp.zeros([]) if log_loss else None,
+        num_inf_grads = jnp.zeros([], jnp.int32),
     )
 
     key = jr.PRNGKey(0)
@@ -583,27 +721,5 @@ def train(config: DictConfig) -> None:
     )
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config_gpt2")
-def test(config: DictConfig) -> None:
-    # logging.info(OmegaConf.to_yaml(config))
-
-    # Initialize C4 dataloader for gpt2.
-    tokenizer = transformers.GPT2TokenizerFast.from_pretrained("gpt2")
-    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-
-    train_loader = load_c4_data(config, tokenizer)
-
-    # Initialize model, optimizer, and loss.
-    model = GPT(tokenizer.vocab_size, config.model, key=jr.PRNGKey(42))
-    optimizer, opt_state = init_optimizer(model, config, logger=None)
-
-    params = eqx.filter(model, eqx.is_array)
-    updates = jtu.tree_map(jnp.ones_like, params)
-
-    # print(optimizer)
-    optimizer.update(updates, opt_state, params)
-
-
 if __name__ == "__main__":
     train()
-    # test()
