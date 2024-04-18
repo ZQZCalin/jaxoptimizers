@@ -1,3 +1,5 @@
+"""Util functions."""
+
 import jax
 from jax import numpy as jnp
 from jax import random as jr
@@ -8,8 +10,17 @@ from typing import Tuple, Any, Optional, Sequence, Union, NamedTuple, Callable
 import ml_dtypes
 
 
-# Util functions for tree manipulation. 
+# Other util functions.
+def merge_non_zero_dict(target, source):
+    """Merges non-zero items in source dictionary into target dictionary.
+    This is a mutable operation.
+    """
+    for key, value in source.items():
+        if not value == 0:
+            target[key] = value
 
+
+# Util functions for tree manipulation. 
 
 def zero_tree(tree):
     """Returns an all-zero tree with the same structure as the input."""

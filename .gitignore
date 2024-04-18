@@ -23,7 +23,7 @@ wandb/
 
 # batch job and output files
 batch_job/
-batch_job.sh.*
+*.sh.*
 
 # other directories
 opt/

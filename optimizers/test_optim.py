@@ -11,7 +11,9 @@ sys.path.append('../jaxoptimizers')
 import util
 import online_learners as ol
 from o2nc import online_nonconvex
-import wandb
+import benchmark
+import scheduler
+import optim
 
 
 def test_optimizer(
@@ -34,40 +36,42 @@ def test_optimizer(
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         print(f"round{i+1} new params:\n", params)
-    
 
-if __name__ == "__main__":
-    # optimizer = eo2nc_unconstrained_ogd(learning_rate=0.01)
-    # optimizer = adamw()
-        
-    # online_learner = ol.ogd(learning_rate=0.01)
 
-    # online_learner = ol.blackbox_reduction(
-    #     magnitude_learner=ol.kt_bettor(eps=10),
-    #     direction_learner=ol.blackbox_ftrl(beta=1.0),
-    #     weight_decay=0.01,
-    # )
-
+def test_sgdm():
     learning_rate = optax.linear_schedule(0.1, 0.01, 10000)
 
-    online_learner = ol.ogd_mirror_descent(
-        learning_rate=learning_rate,
-        beta=1.0,
-        mu=0.0
-    )
-
-    optimizer = online_nonconvex(
-        online_learner=online_learner,
-        random_scaling=lambda key: jr.exponential(key),
-        seed=0,
-    )
+    optimizer = benchmark.sgdm(learning_rate, beta=1.0, weight_decay=0.0)
     
     grad_clip = optax.clip_by_global_norm(10.0)
     optimizer = optax.chain(
         grad_clip,
         optax.apply_if_finite(optimizer, 15)
-        # optimizer
     )
-    # The issue occurs in optax.apply_if_finite()
 
     test_optimizer(optimizer)
+    
+
+def test_jump():
+    normal_lr = scheduler.warmup_linear_decay_schedule(0.0, 3e-4, 450, 4500)
+    normal_optim = benchmark.adamw(
+        normal_lr, 0.9, 0.999, 1e-8, 0.0
+    )
+    jump_lr = scheduler.warmup_linear_decay_schedule(0.0, 1e-6, 50, 500)
+    jump_optim = benchmark.adamw(
+        jump_lr, 0.9, 0.999, 1e-8, 0.0
+    )
+    optimizer = optim.jump_trajectory(
+        normal_optim, jump_optim, 4500, 500
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(10.0),
+        optax.apply_if_finite(optimizer, 15)
+    )
+
+    test_optimizer(optimizer)
+
+
+if __name__ == "__main__":
+    # test_sgdm()
+    test_jump()

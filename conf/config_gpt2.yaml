@@ -7,12 +7,19 @@ model:
   rescale_residuals: False 
 
 train:
+  # dataset: "c4"
+  dataset: "pile"
+  # Note: currently this data_path is NOT used in train.py
   data_path: "/projectnb/aclab/datasets/c4/en/"
 
   max_steps: 50000
 
   # clip the gradient to have l2 norm at most this value
   gradient_clip_val: 10.0
+
+  # random scaling options
+  random_scaling: "exponential"
+  random_scaling_seed: 0
 
   # whether to use automatic mixed precision
   use_amp: True
@@ -21,8 +28,13 @@ train:
   
   batch_size: 4 # number of examples placed on each GPU
 
-  wandb_project: "o2nc_opt"
+  # wandb_project: "gpt2_c4(conclusive_report)"
+  wandb_project: "gpt2_pile"
   wandb_logs_per_sec: 1.0
+
+  # if true, runs benchmark optimizers. otherwise, defaults to 
+  # run online-to-nonconvex algorithms with config.optimizer.
+  run_benchmark: False
   
   # this will slow down computation a bit (I believe due to extra GPU/CPU communication),
   # but will log more stuff (like learning rates).
@@ -30,8 +42,25 @@ train:
   # round per iteration and I don't think the logging data should significantly impact it.
   log_callback_data: True
 
-  # if true, logs additional statistics such as F(x_t)-F(x_{t-1}), <\nabla F(x_t), Delta_t>, etc.
-  log_extra: True
+  # logging these additional stats requires another forward pass and additional memory.
+  # you can save memory / speed by turn off each of the following configurations
+  # TODO: update the log_config to be more specific
+  log_config:
+    # In terms of computation memory:
+    # stores the last gradient g(n-1)
+    last_grads: True
+    # stores the sum of past gradients g(1:n-1)
+    past_grads: True
+    # stores the change in parameter x(n) - x(n-1)
+    last_params: True
+    # In terms of computation speed:
+    # computes f(x(n-1), zn), which costs an additional forward pass
+    compute_forward: True
+    # computes g(x(n-1), zn), which costs an additional forward and backward pass
+    compute_backward: False
+    # TODO: to be deprecated
+    grads: True
+    loss: True
   
   running_stats_window: 1000
 
@@ -43,60 +72,69 @@ train:
   dataloader_workers: 2
 
 optimizer:
-  # whether wraps the online learner with o2nc/eo2nc. values in ["o2nc", "eo2nc", null].
-  wrap_o2nc: "o2nc"
-
-  # PRNGKey seed for random scaling
-  seed: 0
-
-  # random scaling function. values in ["deterministic", "exponential", ...]
-  random_scaling: "exponential"
+  # base online learner.
+  # ["ada_ftrl", "normalized_blackbox", "kt_blackbox", "ogd_mirror_descent"]
+  online_learner: "ogd_mirror_descent"
 
   # learning rate scheduler
-  lr: 0.01
-  lr_schedule: "cosine"
-  lr_warmup: 5000
+  lr_config:
+    lr: 0.01
+    schedule: "cosine"
+    warmup: 5000
 
-  # base online learner. currently supports
-  # ["ada_ftrl", "normalized_blackbox", "ogd_mirror_descent"]
-  # Ada-FTRL
-  # online_learner: "ada_ftrl"
-  # ol_config:
-  #   beta1: 0.9
-  #   beta2: 0.999
-  #   eps: 1e-8
-  #   scale_exponential: False 
-  #   scale_lr: False 
-  #   scale_eps: False
-  # Blackbox FTRL
-  # Commented on 2024/03/28
-  # online_learner: "normalized_blackbox"
-  # ol_config:
-  #   magnitude_learner: "kt"
-  #   eps: 5
-  #   Lipschitz: 20
-  #   beta: 1.0
-  #   weight_decay: 0.0
-  #   per_layer: True
-  online_learner: "ogd_mirror_descent"
-  ol_config:
+  # configuration of the base online learner.
+  # for simplicity of management, each configuration is separated.
+  ada_ftrl_config:
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    scale_exponential: False 
+    scale_lr: False 
+    scale_eps: False
+    
+  kt_blackbox_config:
+    eps: 5
+    Lipschitz: 20
     beta: 1.0
+    weight_decay: 0.0
+    per_layer: True
+
+  ogd_md_config:
+    beta: 0.99
     mu: 0.0
 
 
 benchmark:
-  # if true, runs adamw benchmark.
-  run_benchmark: False
+  # ["adamw", "sgdm", "polar", "jump"]
+  optim: "adamw"
 
-  # if true, uses optax.adamw. should always set to False.
-  use_default: False
+  lr_config:
+    lr: 3e-4
+    schedule: "cosine"
+    warmup: 5000
 
-  lr: 3e-4
-  lr_schedule: "cosine"
-  lr_warmup: 5000
+  adamw_config:
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.01
+    debias_beta1: True
+    debias_beta2: True
 
-  beta1: 0.9
-  beta2: 0.999
-  weight_decay: 0.01
-  debias_beta1: True
-  debias_beta2: True
+  sgdm_config:
+    beta: 0.99
+    weight_decay: 0.0
+
+  polar:
+    b1: 0.9
+    b2: 0.999
+    eps: 1e-8
+    direction_wd: 0.1
+    magnitude_wd: 0.1
+
+  jump:
+    normal_steps: 4500
+    jump_steps: 500
+    lr1: 3e-4
+    lr2: 1e-6
+    wd1: 0.1
+    wd2: 0.0
