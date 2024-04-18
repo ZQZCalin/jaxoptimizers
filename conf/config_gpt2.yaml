@@ -105,7 +105,7 @@ optimizer:
 
 
 benchmark:
-  # ["adamw", "sgdm", "polar"]
+  # ["adamw", "sgdm", "polar", "jump"]
   optim: "adamw"
 
   lr_config:
@@ -130,3 +130,11 @@ benchmark:
     eps: 1e-8
     direction_wd: 0.1
     magnitude_wd: 0.1
+
+  jump:
+    normal_steps: 4500
+    jump_steps: 500
+    lr1: 3e-4
+    lr2: 1e-6
+    wd1: 0.1
+    wd2: 0.0

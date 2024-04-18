@@ -272,6 +272,36 @@ def init_optimizer(
                 direction_wd=polar_config.direction_wd,
                 magnitude_wd=polar_config.magnitude_wd,
             )
+        elif benchmark_config.optim == "jump":
+            jump_config = benchmark_config.jump
+            normal_lr = jtu.Partial(
+                lr_wrapper, 
+                scheduler.warmup_linear_decay_schedule(
+                    init_value=0.0,
+                    peak_value=jump_config.lr1,
+                    warmup_steps=0.1*jump_config.normal_steps,
+                    decay_steps=jump_config.normal_steps
+                ),
+                logger=logger
+            )
+            jump_lr = scheduler.warmup_linear_decay_schedule(
+                init_value=0.0,
+                peak_value=jump_config.lr2,
+                warmup_steps=0.1*jump_config.jump_steps,
+                decay_steps=jump_config.jump_steps
+            )
+            normal_optim = benchmark.adamw(
+                normal_lr, 0.9, 0.999, 1e-8, jump_config.wd1
+            )
+            jump_optim = benchmark.adamw(
+                jump_lr, 0.9, 0.999, 1e-8, jump_config.wd2
+            )
+            optimizer = optim.jump_trajectory(
+                normal_optim=normal_optim,
+                jump_optim=jump_optim,
+                normal_steps=jump_config.normal_steps,
+                jump_steps=jump_config.jump_steps
+            )
         else:
             # Default optax adamw optimizer.
             alert_message("Benchmark optimzier is not specified. Defaults to optim.adamw.")
