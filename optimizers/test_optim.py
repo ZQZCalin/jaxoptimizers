@@ -72,6 +72,26 @@ def test_jump():
     test_optimizer(optimizer)
 
 
+def test_jump():
+    normal_lr = scheduler.warmup_linear_decay_schedule(0.0, 3e-4, 450, 4500)
+    normal_optim = benchmark.adamw(
+        normal_lr, 0.9, 0.999, 1e-8, 0.0
+    )
+    jump_lr = scheduler.warmup_linear_decay_schedule(0.0, 1e-6, 50, 500)
+    jump_optim = benchmark.adamw(
+        jump_lr, 0.9, 0.999, 1e-8, 0.0
+    )
+    optimizer = optim.jump_trajectory(
+        normal_optim, jump_optim, 4500, 500
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(10.0),
+        optax.apply_if_finite(optimizer, 15)
+    )
+
+    test_optimizer(optimizer)
+
+
 if __name__ == "__main__":
     # test_sgdm()
     test_jump()

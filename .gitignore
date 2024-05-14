@@ -25,7 +25,11 @@ wandb/
 batch_job/
 *.sh.*
 
+# checkpoint files
+checkpoint/
+
 # other directories
 opt/
 mechanic.py
 trainer.py
+test.py

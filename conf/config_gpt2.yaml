@@ -6,18 +6,28 @@ model:
   context_length: 1024
   rescale_residuals: False 
 
+
 train:
-  # dataset: "c4"
+  # dataset. supposrts "c4", "pile"
   dataset: "pile"
-  # Note: currently this data_path is NOT used in train.py
-  data_path: "/projectnb/aclab/datasets/c4/en/"
 
   max_steps: 50000
 
   # clip the gradient to have l2 norm at most this value
   gradient_clip_val: 10.0
 
-  # random scaling options
+  # optimizer/online learner name.
+  # optimizers include "adamw", "sgdm", "polar", "jump"
+  # online learners include "ogd_md"
+  optimizer: "adamw"
+
+  # whether to wrap the optimizer with online to nonconvex conversion
+  # for some most optimizers/online learners, they have default value of wrap_o2nc 
+  # (e.g., some online learners are always wrapped, and some optimizers are never wrapped),
+  # which overwrites this setting.
+  wrap_o2nc: False
+
+  # random scaling options. supports "exponential", "None"
   random_scaling: "exponential"
   random_scaling_seed: 0
 
@@ -28,13 +38,12 @@ train:
   
   batch_size: 4 # number of examples placed on each GPU
 
+  # shuffle buffer for data loader. 0 means to shuffle.
+  shuffle_buffer_size: 0
+
   # wandb_project: "gpt2_c4(conclusive_report)"
   wandb_project: "gpt2_pile"
   wandb_logs_per_sec: 1.0
-
-  # if true, runs benchmark optimizers. otherwise, defaults to 
-  # run online-to-nonconvex algorithms with config.optimizer.
-  run_benchmark: False
   
   # this will slow down computation a bit (I believe due to extra GPU/CPU communication),
   # but will log more stuff (like learning rates).
@@ -48,16 +57,16 @@ train:
   log_config:
     # In terms of computation memory:
     # stores the last gradient g(n-1)
-    last_grads: True
+    store_last_grads: True
     # stores the sum of past gradients g(1:n-1)
-    past_grads: True
+    store_past_grads: True
     # stores the change in parameter x(n) - x(n-1)
-    last_params: True
+    store_last_params: True
     # In terms of computation speed:
     # computes f(x(n-1), zn), which costs an additional forward pass
-    compute_forward: True
+    compute_last_loss: True
     # computes g(x(n-1), zn), which costs an additional forward and backward pass
-    compute_backward: False
+    compute_last_grads: False
     # TODO: to be deprecated
     grads: True
     loss: True
@@ -71,70 +80,112 @@ train:
   # prevent dataloading from being the bottleneck.
   dataloader_workers: 2
 
-optimizer:
-  # base online learner.
-  # ["ada_ftrl", "normalized_blackbox", "kt_blackbox", "ogd_mirror_descent"]
-  online_learner: "ogd_mirror_descent"
 
-  # learning rate scheduler
-  lr_config:
-    lr: 0.01
-    schedule: "cosine"
-    warmup: 5000
-
-  # configuration of the base online learner.
-  # for simplicity of management, each configuration is separated.
-  ada_ftrl_config:
-    beta1: 0.9
-    beta2: 0.999
-    eps: 1e-8
-    scale_exponential: False 
-    scale_lr: False 
-    scale_eps: False
-    
-  kt_blackbox_config:
-    eps: 5
-    Lipschitz: 20
-    beta: 1.0
-    weight_decay: 0.0
-    per_layer: True
-
-  ogd_md_config:
-    beta: 0.99
-    mu: 0.0
+checkpoint:
+  # checkpoint mode if path is not null
+  path: null
+  num_steps: 50000
+  save_steps: 10000
+  load_model: null
+  # USE WITH CAUTION: if true, overwrites the entire config file (besides checkpoint)
+  overwrite: False
 
 
-benchmark:
-  # ["adamw", "sgdm", "polar", "jump"]
-  optim: "adamw"
-
+# ========================================================================
+# Below are specific configurations for each optimzer / online learner.
+# Most configurations are tuned to be optimal.
+# ========================================================================
+adamw:
   lr_config:
     lr: 3e-4
-    schedule: "cosine"
+    schedule: "linear"
     warmup: 5000
+    max_steps: 50000
+  beta1: 0.9
+  beta2: 0.999
+  weight_decay: 0.1
+  debias_beta1: True
+  debias_beta2: True
 
-  adamw_config:
+
+sgdm:
+  lr_config:
+    lr: 3.0
+    schedule: "linear"
+    warmup: 5000
+    max_steps: 50000
+  beta: 0.99
+  weight_decay: 1e-6
+
+
+polar:
+  direction:
+    optim: "adamw"
+    lr_config:
+      lr: 3e-4
+      schedule: "linear"
+      warmup: 5000
+      max_steps: 50000
     beta1: 0.9
     beta2: 0.999
-    weight_decay: 0.01
+    weight_decay: 0.0
     debias_beta1: True
     debias_beta2: True
 
-  sgdm_config:
-    beta: 0.99
+  magnitude:
+    optim: "adamw"
+    lr_config:
+      lr: 1e-6
+      schedule: "linear"
+      warmup: 5000
+      max_steps: 50000
+    beta1: 0.9
+    beta2: 0.999
     weight_decay: 0.0
+    debias_beta1: True
+    debias_beta2: True
 
-  polar:
-    b1: 0.9
-    b2: 0.999
-    eps: 1e-8
-    direction_wd: 0.1
-    magnitude_wd: 0.1
+
+jump:
+  normal_steps: 4500
+  jump_steps: 500
+
+  normal:
+    optim: "adamw"
+    lr_config:
+      lr: 3e-4
+      schedule: "linear"
+      warmup: 450
+      max_steps: 4500
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.1
+    debias_beta1: True
+    debias_beta2: True
 
   jump:
-    normal_steps: 4500
-    jump_steps: 500
-    lr1: 3e-4
-    lr2: 1e-6
-    wd1: 0.1
-    wd2: 0.0
+    optim: "adamw"
+    lr_config:
+      lr: 1e-6
+      schedule: "linear"
+      warmup: 50
+      max_steps: 500
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0
+    debias_beta1: True
+    debias_beta2: True
+
+
+ogd_md:
+  lr_config:
+    lr: 0.01
+    schedule: "linear"
+    warmup: 5000
+  beta: 0.99
+  mu: 0.0
+
+
+blackbox:
+  magnitude: "kt"
+  direction: "ftrl"

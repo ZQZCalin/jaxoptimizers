@@ -172,6 +172,27 @@ def test_ogd_mirror_descent_large_G(train_full=False):
         simple_train(learner, loss_fn, params=init_params, num_steps=T)
 
 
+def test_pfmd(train_full=False):
+    d = 3
+    D = 100
+    print(f">>>Testing ogd_mirror_descent on loss f(x) = \|x-{D}e\|^2")
+
+    x_min = D*jnp.ones(shape=d)
+    T = 1000 if train_full else 20
+    learner = ol.parameter_free_mirror_descent(
+        G=800, eps=1, num_grids=1
+    )
+
+    def loss_fn(x):
+        return jnp.sum((x-x_min) * (x-x_min))
+
+    init_params = jnp.zeros(shape=d)
+
+    if train_full:
+        train(learner, loss_fn, params=init_params, num_steps=T)
+    else:
+        simple_train(learner, loss_fn, params=init_params, num_steps=1000)
+
 
 if __name__ == "__main__":
     config = {
@@ -184,4 +205,5 @@ if __name__ == "__main__":
     # test_normalized_blackbox()
     # test_normalized_blackbox_large_G(eps=10, G=200)
     # test_normalized_blackbox_per_layer_large_G(eps=10, G=100)
-    test_ogd_mirror_descent_large_G(train_full=False)
+    # test_ogd_mirror_descent_large_G(train_full=False)
+    test_pfmd()

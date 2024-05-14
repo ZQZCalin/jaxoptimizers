@@ -18,11 +18,6 @@ import benchmark
 
 class PolarDescentState(NamedTuple):
     """polar_descent state."""
-    count: chex.Array
-    # dir_mu: Updates
-    # dir_nu: Updates
-    # mag_mu: Updates
-    # mag_nu: Updates
     dir_state: OptState
     mag_state: OptState
 
@@ -30,13 +25,6 @@ class PolarDescentState(NamedTuple):
 def polar_descent(
     direction_optim: GradientTransformation,
     magnitude_optim: GradientTransformation,
-    # direction_lr: ScalarOrSchedule,
-    # magnitude_lr: ScalarOrSchedule,
-    # b1: float = 0.9,
-    # b2: float = 0.999,
-    # eps: float = 1e-8,
-    # direction_wd = 0.0,
-    # magnitude_wd = 0.0,
 ) -> GradientTransformation:
     """Decomposes direction and magnitude and updates each separately.
 
@@ -60,13 +48,8 @@ def polar_descent(
         mag = util.tree_l2_norm(params)
         dir = util.tree_scalar_multiply(params, 1/mag)
         return PolarDescentState(
-            count=jnp.zeros([], jnp.int32),
             dir_state=direction_optim.init(dir),
             mag_state=magnitude_optim.init(mag),
-            # dir_mu=util.zero_tree(params),
-            # dir_nu=util.zero_tree(params),
-            # mag_mu=jnp.zeros([]),
-            # mag_nu=jnp.zeros([]),
         )
     
     def update_fn(updates, state, params):
@@ -75,36 +58,13 @@ def polar_descent(
         dir = util.tree_scalar_multiply(params, 1/mag)
         dir_grads = util.tree_scalar_multiply(updates, mag)
         mag_grads = util.tree_inner_product(updates, dir)
-        count_inc = optax.safe_int32_increment(state.count)
 
         # Update direction.
-        # dir_mu = jtu.tree_map(
-        #     lambda m, g: b1*m + (1-b1)*g, state.dir_mu, dir_grads)
-        # dir_nu = jtu.tree_map(
-        #     lambda v, g: b2*v + (1-b2)*g**2, state.dir_nu, dir_grads)
-        # dir_mu_hat = util.tree_scalar_multiply(dir_mu, 1/(1-b1**count_inc))
-        # dir_nu_hat = util.tree_scalar_multiply(dir_nu, 1/(1-b2**count_inc))
-        # dir_eta = scheduler.get_current_lr(direction_lr, state.count)
-        # dir_updates = jtu.tree_map(
-        #     lambda m, v, p: -dir_eta * (m/(eps+jnp.sqrt(v)) + direction_wd*p),
-        #     dir_mu_hat, dir_nu_hat, dir
-        # )
         dir_updates, dir_state = direction_optim.update(dir_grads, state.dir_state, dir)
         new_dir = util.tree_normalize(
             optax.apply_updates(dir, dir_updates))      # project direction back to norm=1.
 
         # Update magnitude.
-        # mag_mu = jtu.tree_map(
-        #     lambda m, g: b1*m + (1-b1)*g, state.mag_mu, mag_grads)
-        # mag_nu = jtu.tree_map(
-        #     lambda v, g: b2*v + (1-b2)*g**2, state.mag_nu, mag_grads)
-        # mag_mu_hat = util.tree_scalar_multiply(mag_mu, 1/(1-b1**count_inc))
-        # mag_nu_hat = util.tree_scalar_multiply(mag_nu, 1/(1-b2**count_inc))
-        # mag_eta = scheduler.get_current_lr(magnitude_lr, state.count)
-        # mag_updates = jtu.tree_map(
-        #     lambda m, v, p: -mag_eta * (m/(eps+jnp.sqrt(v)) + magnitude_wd*p),
-        #     mag_mu_hat, mag_nu_hat, mag
-        # )
         mag_updates, mag_state = magnitude_optim.update(mag_grads, state.mag_state, mag)
         new_mag = optax.apply_updates(mag, mag_updates)
 
@@ -112,13 +72,8 @@ def polar_descent(
         new_params = util.tree_scalar_multiply(new_dir, new_mag)
         new_updates = util.tree_subtract(new_params, params)
         return new_updates, PolarDescentState(
-            count=count_inc,
             dir_state=dir_state,
-            mag_state=mag_state
-            # dir_mu=dir_mu,
-            # dir_nu=dir_nu,
-            # mag_mu=mag_mu,
-            # mag_nu=mag_nu,
+            mag_state=mag_state,
         )
     
     return GradientTransformation(init_fn, update_fn)

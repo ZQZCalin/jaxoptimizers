@@ -43,4 +43,9 @@ if __name__ == "__main__":
     # test_tree_inner()
     # test_tree_l1_norm()
     # test_tree_cosine_similarity()
-    test_is_finite_tree()
+    # test_is_finite_tree()
+    import os
+    cwd = os.getcwd()
+    print(f"dir: {cwd}")
+    path = os.path.join(os.getcwd(), "dir/file")
+    print(f"path: {path}")

@@ -64,7 +64,7 @@ class OnlineLearnerUpdateExtraArgsFn(Protocol):
 class OnlineLearner(NamedTuple):
     """A pair of init and update functions implementing online learners.
 
-    In our context, online learners aim to minimize the "weighted and regularized regret":
+    In our context, online learners aim to minimize the "anytime weighted and regularized regret":
         Regret_T(u) = sum_{t=1}^T beta^{T-t} * (<g_t, w_t - u> + mu/2*|w_t|^2),
     where beta in [0,1] denotes the "exponentiated gradient constant" (which can be equivalently viewed as a momentum constant)
     and mu > 0 denotes the l2 regularization constant.
@@ -691,6 +691,59 @@ def normalized_blackbox(
             base_state=base_state,
             key=key
         )
+    
+    return OnlineLearner(init_fn, update_fn)
+
+
+class ParameterFreeMirrorDescentState(NamedTuple):
+    """parameter_free_mirror_descent state"""
+    V: Updates
+    params: list[Params]
+
+
+def parameter_free_mirror_descent(
+    G: float,
+    eps: float,
+    num_grids: int=1,
+) -> OnlineLearner:
+    
+    # TODO: add an option for a list of customized schedules.
+    etas = [2**-k / G for k in range(num_grids)]
+    eps = eps / num_grids
+    
+    def init_fn(params):
+        return ParameterFreeMirrorDescentState(
+            V=jnp.array([4*G**2]),
+            params=[util.zero_tree(params) for _ in range(num_grids)]
+        )
+    
+    def update_fn(updates, state, params=None):
+        del params
+        grads_sqnorm = util.tree_l2_norm(updates)**2
+        new_V = state.V + grads_sqnorm
+        alpha = eps * G**2 / (new_V * jnp.log(new_V/G**2)**2)
+
+        new_params = []
+        for eta, w_eta in zip(etas, state.params):
+            w_norm = util.tree_l2_norm(w_eta)
+            theta = jax.lax.cond(
+                w_norm == 0,
+                lambda _: util.negative_tree(updates),
+                lambda _: jtu.tree_map(
+                    lambda w, g: 2*(w/w_norm)*jnp.log(w_norm/alpha)/eta - g, w_eta, updates),
+                operand=None
+            )
+            theta_norm = util.tree_l2_norm(theta)
+            new_w_eta = jtu.tree_map(
+                lambda t: alpha*theta/theta_norm * (jnp.exp(eta/2*jnp.maximum(theta_norm-2*eta*grads_sqnorm, 0))-1), theta)
+            new_params.append(new_w_eta)
+            # jax.debug.print('eta={x}, theta={t}, w={w}, w/alpha={y}', x=eta, t=theta, w=new_w_eta, y=w_norm/alpha)
+        sum_new_params = jtu.tree_map(
+            lambda x: jnp.sum(x, axis=0),
+            jtu.tree_map(lambda *xs: jnp.stack(xs), *new_params)
+        )
+        # jax.debug.print('debug: V={v}, alpha={a}', v=new_V, a=alpha)
+        return sum_new_params, ParameterFreeMirrorDescentState(V=new_V, params=new_params)
     
     return OnlineLearner(init_fn, update_fn)
 
